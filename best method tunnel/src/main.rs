@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use dialoguer::{Input, Password, Select};
 use chacha20poly1305::{
     aead::{Aead, KeyInit, Payload},
-    XChaCha20Poly1305, XNonce,
+    ChaCha20Poly1305, Nonce,
 };
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
@@ -35,7 +35,9 @@ const FRAME_OPEN: u8 = 0x01;
 const FRAME_DATA: u8 = 0x02;
 const FRAME_CLOSE: u8 = 0x03;
 
-const NONCE_LEN: usize = 24;
+const HANDSHAKE_NONCE_LEN: usize = 24;
+const AEAD_NONCE_PREFIX_LEN: usize = 4;
+const AEAD_NONCE_LEN: usize = 12;
 const MAC_LEN: usize = 32;
 const TAG_LEN: usize = 16;
 const HEADER_LEN: usize = 18; // version(1) + type(1) + stream_id(4) + seq(8) + len(4)
@@ -108,7 +110,7 @@ enum OutgoingFrame {
 #[derive(Clone, Copy)]
 struct DirectionCrypto {
     key: [u8; 32],
-    nonce_prefix: [u8; 16],
+    nonce_prefix: [u8; AEAD_NONCE_PREFIX_LEN],
 }
 
 #[derive(Clone, Copy)]
@@ -559,9 +561,9 @@ async fn write_frame(
     header[6..14].copy_from_slice(&seq.to_be_bytes());
     header[14..18].copy_from_slice(&(cipher_len as u32).to_be_bytes());
 
-    let cipher = XChaCha20Poly1305::new_from_slice(&crypto.key).map_err(|_| anyhow!("bad key"))?;
+    let cipher = ChaCha20Poly1305::new_from_slice(&crypto.key).map_err(|_| anyhow!("bad key"))?;
     let nonce = build_nonce(&crypto.nonce_prefix, seq);
-    let nonce = XNonce::from_slice(&nonce);
+    let nonce = Nonce::from_slice(&nonce);
     let ciphertext = cipher
         .encrypt(
             nonce,
@@ -602,9 +604,9 @@ async fn read_frame(
     let mut ciphertext = vec![0u8; len];
     reader.read_exact(&mut ciphertext).await?;
 
-    let cipher = XChaCha20Poly1305::new_from_slice(&crypto.key).map_err(|_| anyhow!("bad key"))?;
+    let cipher = ChaCha20Poly1305::new_from_slice(&crypto.key).map_err(|_| anyhow!("bad key"))?;
     let nonce = build_nonce(&crypto.nonce_prefix, seq);
-    let nonce = XNonce::from_slice(&nonce);
+    let nonce = Nonce::from_slice(&nonce);
     let payload = cipher
         .decrypt(
             nonce,
@@ -636,13 +638,13 @@ async fn server_handshake(stream: &mut TcpStream, psk: &[u8; 32]) -> Result<Sess
     if msg_type[0] != HANDSHAKE_CLIENT_HELLO {
         bail!("Unexpected handshake");
     }
-    let mut client_nonce = [0u8; NONCE_LEN];
+    let mut client_nonce = [0u8; HANDSHAKE_NONCE_LEN];
     stream.read_exact(&mut client_nonce).await?;
 
-    let mut server_nonce = [0u8; NONCE_LEN];
+    let mut server_nonce = [0u8; HANDSHAKE_NONCE_LEN];
     rand::rngs::OsRng.fill_bytes(&mut server_nonce);
 
-    let mut data = Vec::with_capacity(6 + NONCE_LEN * 2);
+    let mut data = Vec::with_capacity(6 + HANDSHAKE_NONCE_LEN * 2);
     data.extend_from_slice(b"server");
     data.extend_from_slice(&client_nonce);
     data.extend_from_slice(&server_nonce);
@@ -659,7 +661,7 @@ async fn server_handshake(stream: &mut TcpStream, psk: &[u8; 32]) -> Result<Sess
     let mut client_mac = [0u8; MAC_LEN];
     stream.read_exact(&mut client_mac).await?;
 
-    let mut data = Vec::with_capacity(6 + NONCE_LEN * 2);
+    let mut data = Vec::with_capacity(6 + HANDSHAKE_NONCE_LEN * 2);
     data.extend_from_slice(b"client");
     data.extend_from_slice(&server_nonce);
     data.extend_from_slice(&client_nonce);
@@ -674,7 +676,7 @@ async fn server_handshake(stream: &mut TcpStream, psk: &[u8; 32]) -> Result<Sess
 }
 
 async fn client_handshake(stream: &mut TcpStream, psk: &[u8; 32]) -> Result<SessionKeys> {
-    let mut client_nonce = [0u8; NONCE_LEN];
+    let mut client_nonce = [0u8; HANDSHAKE_NONCE_LEN];
     rand::rngs::OsRng.fill_bytes(&mut client_nonce);
 
     stream.write_all(&[HANDSHAKE_CLIENT_HELLO]).await?;
@@ -685,12 +687,12 @@ async fn client_handshake(stream: &mut TcpStream, psk: &[u8; 32]) -> Result<Sess
     if msg_type[0] != HANDSHAKE_SERVER_HELLO {
         bail!("Unexpected handshake");
     }
-    let mut server_nonce = [0u8; NONCE_LEN];
+    let mut server_nonce = [0u8; HANDSHAKE_NONCE_LEN];
     stream.read_exact(&mut server_nonce).await?;
     let mut server_mac = [0u8; MAC_LEN];
     stream.read_exact(&mut server_mac).await?;
 
-    let mut data = Vec::with_capacity(6 + NONCE_LEN * 2);
+    let mut data = Vec::with_capacity(6 + HANDSHAKE_NONCE_LEN * 2);
     data.extend_from_slice(b"server");
     data.extend_from_slice(&client_nonce);
     data.extend_from_slice(&server_nonce);
@@ -699,7 +701,7 @@ async fn client_handshake(stream: &mut TcpStream, psk: &[u8; 32]) -> Result<Sess
         bail!("Handshake auth failed");
     }
 
-    let mut data = Vec::with_capacity(6 + NONCE_LEN * 2);
+    let mut data = Vec::with_capacity(6 + HANDSHAKE_NONCE_LEN * 2);
     data.extend_from_slice(b"client");
     data.extend_from_slice(&server_nonce);
     data.extend_from_slice(&client_nonce);
@@ -718,14 +720,14 @@ async fn client_handshake(stream: &mut TcpStream, psk: &[u8; 32]) -> Result<Sess
 
 fn derive_session_keys(
     psk: &[u8; 32],
-    client_nonce: &[u8; NONCE_LEN],
-    server_nonce: &[u8; NONCE_LEN],
+    client_nonce: &[u8; HANDSHAKE_NONCE_LEN],
+    server_nonce: &[u8; HANDSHAKE_NONCE_LEN],
 ) -> Result<SessionKeys> {
-    let mut salt = Vec::with_capacity(NONCE_LEN * 2);
+    let mut salt = Vec::with_capacity(HANDSHAKE_NONCE_LEN * 2);
     salt.extend_from_slice(client_nonce);
     salt.extend_from_slice(server_nonce);
     let hkdf = Hkdf::<Sha256>::new(Some(&salt), psk);
-    let mut okm = [0u8; 96];
+    let mut okm = [0u8; 72];
     hkdf.expand(b"tunnel-v1-keys", &mut okm)
         .map_err(|_| anyhow!("HKDF expand failed"))?;
 
@@ -733,10 +735,10 @@ fn derive_session_keys(
     c2s_key.copy_from_slice(&okm[0..32]);
     let mut s2c_key = [0u8; 32];
     s2c_key.copy_from_slice(&okm[32..64]);
-    let mut c2s_nonce_prefix = [0u8; 16];
-    c2s_nonce_prefix.copy_from_slice(&okm[64..80]);
-    let mut s2c_nonce_prefix = [0u8; 16];
-    s2c_nonce_prefix.copy_from_slice(&okm[80..96]);
+    let mut c2s_nonce_prefix = [0u8; AEAD_NONCE_PREFIX_LEN];
+    c2s_nonce_prefix.copy_from_slice(&okm[64..68]);
+    let mut s2c_nonce_prefix = [0u8; AEAD_NONCE_PREFIX_LEN];
+    s2c_nonce_prefix.copy_from_slice(&okm[68..72]);
 
     Ok(SessionKeys {
         c2s: DirectionCrypto {
@@ -784,10 +786,10 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn build_nonce(prefix: &[u8; 16], seq: u64) -> [u8; 24] {
-    let mut nonce = [0u8; 24];
-    nonce[..16].copy_from_slice(prefix);
-    nonce[16..].copy_from_slice(&seq.to_be_bytes());
+fn build_nonce(prefix: &[u8; AEAD_NONCE_PREFIX_LEN], seq: u64) -> [u8; AEAD_NONCE_LEN] {
+    let mut nonce = [0u8; AEAD_NONCE_LEN];
+    nonce[..AEAD_NONCE_PREFIX_LEN].copy_from_slice(prefix);
+    nonce[AEAD_NONCE_PREFIX_LEN..].copy_from_slice(&seq.to_be_bytes());
     nonce
 }
 
