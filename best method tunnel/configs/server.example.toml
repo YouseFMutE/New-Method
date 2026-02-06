@@ -1,0 +1,9 @@
+role = "server"
+psk_hex = "REPLACE_WITH_64_HEX_CHARS"
+max_frame_size = 1048576
+reconnect_delay_ms = 1000
+reconnect_max_delay_ms = 15000
+
+[server]
+tunnel_listen = "0.0.0.0:9000"
+public_listen = "0.0.0.0:1414"

@@ -1,0 +1,9 @@
+role = "client"
+psk_hex = "REPLACE_WITH_64_HEX_CHARS"
+max_frame_size = 1048576
+reconnect_delay_ms = 1000
+reconnect_max_delay_ms = 15000
+
+[client]
+server_tunnel = "server.example.com:9000"
+target = "127.0.0.1:1414"

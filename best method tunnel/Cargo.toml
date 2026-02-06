@@ -1,0 +1,18 @@
+[package]
+name = "mytunnel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+dialoguer = "0.11"
+hex = "0.4"
+hkdf = "0.12"
+hmac = "0.12"
+rand = "0.8"
+serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10"
+tokio = { version = "1.36", features = ["full"] }
+toml = "0.8"
+chacha20poly1305 = { version = "0.10", features = ["xchacha20"] }

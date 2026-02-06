@@ -27,34 +27,65 @@
 
 در این مرحله برنامه از شما می‌پرسد:
 - نقش: Server یا Client
-- پورت listen روی Server (مثلا 1414)
+- پورت عمومی روی Server (مثلا 1414)
+- پورت تونل روی Server (مثلا 9000)
 - مقصد نهایی روی Client (مثلا 127.0.0.1:1414)
 - کلید مشترک امنیتی (PSK)
+- زمان تلاش مجدد اتصال (reconnect)
+  - reconnect_delay_ms و reconnect_max_delay_ms
 
 پس از پاسخ‌ها، فایل تنظیمات ساخته می‌شود.
 
 4) اجرای سرویس
 --------------
 Server:
-  mytunnel run --role server
+  mytunnel run
+  - پورت public_listen برای کاربران
+  - پورت tunnel_listen برای اتصال Client
 
 Client:
-  mytunnel run --role client
+  mytunnel run
 
-5) تست سریع
+5) راه‌اندازی سیستم‌سرویسی (systemd)
+-------------------------------------
+اسکریپت آماده:
+  sudo /PATH/TO/scripts/first_run.sh
+
+این اسکریپت:
+- اگر cargo نصب نباشد، Rust را نصب می‌کند
+- پروژه را build می‌کند
+- فایل config را در /etc/mytunnel/config.toml می‌سازد
+- سرویس systemd می‌سازد و اجرا می‌کند
+ - لاگ را در /var/log/mytunnel/mytunnel.log ذخیره می‌کند
+
+قالب‌های آماده کانفیگ:
+  /PATH/TO/configs/server.example.toml
+  /PATH/TO/configs/client.example.toml
+
+برای استفاده سریع از قالب:
+  CONFIG_TEMPLATE=server sudo /PATH/TO/scripts/first_run.sh
+  CONFIG_TEMPLATE=client sudo /PATH/TO/scripts/first_run.sh
+
+6) تست سریع
 ------------
 از یک کلاینت دیگر روی اینترنت یا شبکه:
   nc <server_ip> 1414
 باید داده به مقصد روی Client برسد.
 
-6) نکات امنیتی
+7) نکات امنیتی
 --------------
-- این سیستم از PSK استفاده می‌کند و **TLS ندارد**.
+- این سیستم از PSK و AEAD استفاده می‌کند و **TLS ندارد**.
+- داده‌ها **رمزنگاری می‌شوند**.
 - PSK باید قوی باشد (حداقل 32 بایت تصادفی).
 - PSK را در اختیار شخص ثالث قرار ندهید.
 - پورت Server را در فایروال فقط برای IPهای مجاز باز کنید.
 
-7) خطاهای رایج
+8) نکات کارایی
+---------------
+- رمزنگاری AEAD سربار کمی دارد، اما CPU مصرف می‌کند.
+- برای کارایی بهتر: `max_frame_size` را خیلی کوچک نکنید.
+
+9) خطاهای رایج
 ---------------
 - اتصال برقرار نمی‌شود:
   - پورت‌ها را چک کنید.
@@ -68,3 +99,15 @@ Client:
 پشتیبانی:
 ----------
 اگر نیاز به امکانات اضافه (چند پورت، داشبورد، لاگ پیشرفته) دارید، اعلام کنید.
+
+10) مانیتورینگ سریع
+--------------------
+اسکریپت مانیتورینگ:
+  sudo /PATH/TO/scripts/monitor.sh
+
+لاگ‌ها:
+  tail -f /var/log/mytunnel/mytunnel.log
+
+همچنین:
+  systemctl status mytunnel
+  journalctl -u mytunnel -f

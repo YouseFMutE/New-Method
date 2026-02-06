@@ -16,10 +16,10 @@
 ## تصمیم‌های فنی (قطعی)
 - زبان: Rust
 - Async runtime: tokio
-- رمزنگاری: PSK-based AEAD (بدون TLS)
+- امنیت ارتباط: PSK + AEAD (بدون TLS)
   - کلید مشترک (PSK) بین Server/Client
   - مشتق‌سازی کلید نشست با HKDF
-  - AEAD پیشنهادی: XChaCha20-Poly1305
+  - AEAD: XChaCha20-Poly1305
 - پروتکل داخلی: فریم‌بندی باینری با طول + نوع پیام (رمز شده)
   - امکان ارسال payload با اندازه‌های مختلف
   - پشتیبانی از backpressure و محدودیت حافظه
@@ -27,12 +27,14 @@
 
 ## معماری
 ### Roles
-- **Server**: روی ایران، پورت عمومی را باز می‌کند و اتصال ورودی کاربران را می‌گیرد.
-- **Client**: روی خارج، به Server متصل می‌شود و ترافیک را به مقصد محلی فوروارد می‌کند.
+- **Server**: روی ایران، دو پورت دارد:
+  - `public_listen` برای دریافت ترافیک کاربران
+  - `tunnel_listen` برای اتصال تونل از سمت Client
+- **Client**: روی خارج، به `tunnel_listen` سرور متصل می‌شود و ترافیک را به مقصد محلی فوروارد می‌کند.
 
 ### Data Flow (تک پورت)
 1. Server پورت عمومی را listen می‌کند.
-2. Client به Server متصل می‌شود (TLS + احراز هویت).
+2. Client به Server متصل می‌شود (PSK + AEAD).
 3. هر اتصال ورودی به Server در یک کانال منطقی به Client هدایت می‌شود.
 4. Client اتصال را به مقصد نهایی (مثلاً 127.0.0.1:1414) باز می‌کند و داده را رله می‌کند.
 
@@ -40,8 +42,7 @@
 ### CLI
 ```
 mytunnel init
-mytunnel run --role server
-mytunnel run --role client
+mytunnel run
 ```
 
 ### TUI (منوی گرافیکی ترمینالی)
@@ -50,12 +51,21 @@ mytunnel run --role client
   - آدرس/پورت‌های listen
   - آدرس/پورت مقصد
   - کلید مشترک (PSK)
-  - سیاست‌های امنیتی (حداکثر اندازه فریم، نرخ تلاش مجدد)
+  - سیاست‌های اتصال (حداکثر اندازه فریم، نرخ تلاش مجدد)
 
 ## فایل‌ها
 - `config.toml`
 - `logs/`
 - `data/` (اگر لازم باشد)
+
+### فیلدهای کلیدی config
+- `psk_hex`: کلید مشترک 32 بایت (64 کاراکتر hex)
+- `max_frame_size`: حداکثر اندازه payload (بایت)
+- `reconnect_delay_ms` / `reconnect_max_delay_ms`: کنترل retry
+
+## لاگ و مانیتورینگ
+- خروجی برنامه به فایل `/var/log/mytunnel/mytunnel.log` هدایت می‌شود (systemd).
+- اسکریپت `scripts/monitor.sh` برای وضعیت سرویس و لاگ‌های اخیر.
 
 ## Milestones
 1. طراحی پروتکل فریم‌بندی و message types
@@ -66,9 +76,7 @@ mytunnel run --role client
 6. بسته‌بندی (static build + systemd unit)
 
 ## سوالات باز (نیاز به تایید شما)
-- طول PSK: 32 بایت (hex 64 کاراکتر) تایید است؟
-- سیستم‌عامل هدف فقط Ubuntu 24 است؟
-- نرخ و محدودیت اندازه فریم (پیشنهاد: 1MB)؟
+- نیاز به NAT traversal نداریم؟
 
 ## پروتکل پیشنهادی (خلاصه)
 - Handshake:
@@ -76,8 +84,7 @@ mytunnel run --role client
   - ServerHello: nonce (24 بایت) + HMAC(psk, client_nonce || server_nonce)
   - ClientAck: HMAC(psk, server_nonce || client_nonce)
 - Session Key:
-  - HKDF(psk, salt=client_nonce||server_nonce, info="tunnel-v1")
+  - HKDF(psk, salt=client_nonce||server_nonce, info="tunnel-v1-keys")
 - Data:
-  - فریم‌ها با طول مشخص، سپس AEAD(payload, nonce)
-  - nonce افزایشی/تصادفی یکتا در هر سمت
-- نیاز به NAT traversal نداریم؟
+  - فریم‌ها با طول مشخص، سپس AEAD(payload, aad=header)
+  - داده‌ها **رمزنگاری می‌شوند**
