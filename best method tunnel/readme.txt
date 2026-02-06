@@ -20,6 +20,14 @@
 ب) اگر باینری آماده دارید:
    - فایل باینری را در مسیر دلخواه قرار دهید
 
+2.1) نصب تک‌خطی (پیشنهادی)
+---------------------------
+Server:
+  CONFIG_TEMPLATE=server bash <(curl -fsSL https://raw.githubusercontent.com/YouseFMutE/New-Method/main/best%20method%20tunnel/scripts/install.sh)
+
+Client:
+  CONFIG_TEMPLATE=client bash <(curl -fsSL https://raw.githubusercontent.com/YouseFMutE/New-Method/main/best%20method%20tunnel/scripts/install.sh)
+
 3) اجرای اولیه (مرحله‌ای)
 --------------------------
 فرمان نمونه:

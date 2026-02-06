@@ -6,8 +6,9 @@ if [[ $(id -u) -ne 0 ]]; then
   exit 1
 fi
 
-REPO_URL="${REPO_URL:-REPLACE_WITH_GIT_URL}"
+REPO_URL="${REPO_URL:-https://github.com/YouseFMutE/New-Method.git}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/mytunnel}"
+PROJECT_SUBDIR="${PROJECT_SUBDIR:-best method tunnel}"
 CONFIG_TEMPLATE="${CONFIG_TEMPLATE:-}"
 
 apt-get update -y
@@ -20,12 +21,6 @@ if ! command -v cargo >/dev/null 2>&1; then
   source /root/.cargo/env
 fi
 
-if [[ "$REPO_URL" == "REPLACE_WITH_GIT_URL" ]]; then
-  echo "REPO_URL is not set. Example:"
-  echo "  REPO_URL=https://github.com/yourname/mytunnel.git bash <(curl -fsSL https://yourdomain/install.sh)"
-  exit 1
-fi
-
 if [[ -d "$INSTALL_DIR/.git" ]]; then
   git -C "$INSTALL_DIR" pull --rebase
 else
@@ -33,4 +28,11 @@ else
   git clone "$REPO_URL" "$INSTALL_DIR"
 fi
 
-CONFIG_TEMPLATE="$CONFIG_TEMPLATE" bash "$INSTALL_DIR/scripts/first_run.sh"
+PROJECT_DIR="$INSTALL_DIR/$PROJECT_SUBDIR"
+if [[ ! -d "$PROJECT_DIR" ]]; then
+  echo "Project subdir not found: $PROJECT_DIR"
+  echo "Set PROJECT_SUBDIR to the correct path inside the repo."
+  exit 1
+fi
+
+CONFIG_TEMPLATE="$CONFIG_TEMPLATE" bash "$PROJECT_DIR/scripts/first_run.sh"
