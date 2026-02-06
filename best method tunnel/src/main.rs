@@ -210,7 +210,6 @@ fn run_init(config_path: PathBuf) -> Result<()> {
     let toml = toml::to_string_pretty(&config)?;
     std::fs::write(&config_path, toml)?;
     println!("Config written to {}", config_path.display());
-    Ok(())
 }
 
 async fn run(config_path: PathBuf) -> Result<()> {
@@ -753,7 +752,7 @@ fn derive_session_keys(
 }
 
 fn hmac_tag(key: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(key).expect("hmac key");
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("hmac key");
     mac.update(data);
     let tag = mac.finalize().into_bytes();
     let mut out = [0u8; 32];
