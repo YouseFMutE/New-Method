@@ -210,6 +210,7 @@ fn run_init(config_path: PathBuf) -> Result<()> {
     let toml = toml::to_string_pretty(&config)?;
     std::fs::write(&config_path, toml)?;
     println!("Config written to {}", config_path.display());
+    Ok(())
 }
 
 async fn run(config_path: PathBuf) -> Result<()> {
@@ -340,7 +341,6 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], max_frame_size: usize) 
             }
         });
     }
-    Ok(())
 }
 
 async fn run_client(
