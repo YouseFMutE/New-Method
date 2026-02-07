@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -48,6 +48,15 @@ struct ConnState {
 }
 
 type ConnMap = Arc<Mutex<HashMap<u32, Arc<ConnState>>>>;
+
+struct TunnelSession {
+    id: u64,
+    tx: mpsc::Sender<Frame>,
+    conns: ConnMap,
+    next_id: AtomicU32,
+}
+
+type SessionList = Arc<Mutex<Vec<Arc<TunnelSession>>>>;
 
 #[derive(Parser)]
 #[command(name = "mytunnel", version = "0.1.0")]
@@ -96,6 +105,7 @@ struct ServerConfig {
 struct ClientConfig {
     server_tunnel: String,
     target: String,
+    mux_con: Option<u32>,
 }
 
 #[tokio::main]
@@ -191,11 +201,16 @@ fn run_init(config_path: PathBuf) -> Result<()> {
                 .with_prompt("Target address")
                 .default("127.0.0.1:1414".into())
                 .interact_text()?;
+            let mux_con: u32 = Input::new()
+                .with_prompt("TCP mux connections (parallel tunnels)")
+                .default(1)
+                .interact_text()?;
             (
                 None,
                 Some(ClientConfig {
                     server_tunnel,
                     target,
+                    mux_con: Some(mux_con.max(1)),
                 }),
             )
         }
@@ -267,14 +282,14 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], _max_frame_size: usize)
         .await
         .with_context(|| format!("Bind public listener {}", public_listen))?;
 
-    let connections: ConnMap = Arc::new(Mutex::new(HashMap::new()));
-    let tunnel_sender: Arc<Mutex<Option<mpsc::Sender<Frame>>>> = Arc::new(Mutex::new(None));
-    let next_id = Arc::new(AtomicU32::new(1));
+    let sessions: SessionList = Arc::new(Mutex::new(Vec::new()));
+    let session_seq = Arc::new(AtomicU64::new(1));
+    let rr = Arc::new(AtomicUsize::new(0));
 
     // Accept tunnel connection in background.
     {
-        let tunnel_sender = Arc::clone(&tunnel_sender);
-        let connections = Arc::clone(&connections);
+        let sessions = Arc::clone(&sessions);
+        let session_seq = Arc::clone(&session_seq);
         tokio::spawn(async move {
             loop {
                 log_info(&format!(
@@ -288,6 +303,7 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], _max_frame_size: usize)
                         continue;
                     }
                 };
+                let _ = tunnel_stream.set_nodelay(true);
                 let peer = tunnel_stream
                     .peer_addr()
                     .map(|p| p.to_string())
@@ -300,22 +316,28 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], _max_frame_size: usize)
 
                 let (read_half, write_half) = tunnel_stream.into_split();
                 let (tx, rx) = mpsc::channel::<Frame>(2048);
-                *tunnel_sender.lock().await = Some(tx.clone());
+                let session = Arc::new(TunnelSession {
+                    id: session_seq.fetch_add(1, Ordering::Relaxed),
+                    tx: tx.clone(),
+                    conns: Arc::new(Mutex::new(HashMap::new())),
+                    next_id: AtomicU32::new(1),
+                });
+                sessions.lock().await.push(Arc::clone(&session));
 
                 let writer_task = tokio::spawn(tunnel_writer(write_half, rx));
-                let reader_task = tokio::spawn(tunnel_reader_server(
-                    read_half,
-                    Arc::clone(&connections),
-                    tx.clone(),
-                ));
-                let keepalive_task = tokio::spawn(keepalive_loop(tx.clone()));
+                let reader_task =
+                    tokio::spawn(tunnel_reader_server(read_half, Arc::clone(&session.conns), tx));
+                let keepalive_task = tokio::spawn(keepalive_loop(session.tx.clone()));
 
                 let _ = reader_task.await;
                 writer_task.abort();
                 keepalive_task.abort();
 
-                *tunnel_sender.lock().await = None;
-                connections.lock().await.clear();
+                {
+                    let mut list = sessions.lock().await;
+                    list.retain(|s| s.id != session.id);
+                }
+                session.conns.lock().await.clear();
                 log_info("Tunnel disconnected");
             }
         });
@@ -324,22 +346,31 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], _max_frame_size: usize)
     log_info(&format!("Public listen on {}", public_listen));
     loop {
         let (socket, _) = public_listener.accept().await?;
+        let _ = socket.set_nodelay(true);
         let peer = socket
             .peer_addr()
             .map(|p| p.to_string())
             .unwrap_or_else(|_| "unknown".into());
         log_debug(&format!("Public connection from {}", peer));
 
-        let tx_opt = tunnel_sender.lock().await.clone();
-        let tx = match tx_opt {
-            Some(t) => t,
+        let session = {
+            let list = sessions.lock().await;
+            if list.is_empty() {
+                None
+            } else {
+                let idx = rr.fetch_add(1, Ordering::Relaxed) % list.len();
+                Some(list[idx].clone())
+            }
+        };
+        let session = match session {
+            Some(s) => s,
             None => {
                 eprintln!("No tunnel connected; dropping incoming connection from {peer}.");
                 continue;
             }
         };
 
-        let id = next_id.fetch_add(1, Ordering::Relaxed);
+        let id = session.next_id.fetch_add(1, Ordering::Relaxed);
         log_debug(&format!("OPEN id={} from {}", id, peer));
         let (read_half, write_half) = socket.into_split();
         let state = Arc::new(ConnState {
@@ -347,9 +378,10 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], _max_frame_size: usize)
             local_fin: AtomicBool::new(false),
             peer_fin: AtomicBool::new(false),
         });
-        connections.lock().await.insert(id, Arc::clone(&state));
+        session.conns.lock().await.insert(id, Arc::clone(&state));
 
-        if tx
+        if session
+            .tx
             .send(Frame {
                 kind: FRAME_OPEN,
                 id,
@@ -359,12 +391,12 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], _max_frame_size: usize)
             .is_err()
         {
             eprintln!("Failed to send OPEN for id={id}");
-            connections.lock().await.remove(&id);
+            session.conns.lock().await.remove(&id);
             continue;
         }
 
-        let conns = Arc::clone(&connections);
-        let tx_clone = tx.clone();
+        let conns = Arc::clone(&session.conns);
+        let tx_clone = session.tx.clone();
         tokio::spawn(async move {
             pump_socket_to_tunnel(read_half, id, tx_clone, conns).await;
             log_debug(&format!("FIN id={} from {}", id, peer));
@@ -379,18 +411,45 @@ async fn run_client(
     reconnect_delay_ms: u64,
     reconnect_max_delay_ms: u64,
 ) -> Result<()> {
+    let mux_con = client.mux_con.unwrap_or(1).max(1);
+    for idx in 0..mux_con {
+        let client = client.clone();
+        tokio::spawn(run_client_session(
+            idx as usize,
+            client,
+            psk,
+            reconnect_delay_ms,
+            reconnect_max_delay_ms,
+        ));
+    }
+    loop {
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+    }
+}
+
+async fn run_client_session(
+    session_id: usize,
+    client: ClientConfig,
+    psk: [u8; 32],
+    reconnect_delay_ms: u64,
+    reconnect_max_delay_ms: u64,
+) {
     let mut delay = reconnect_delay_ms;
     let connections: ConnMap = Arc::new(Mutex::new(HashMap::new()));
     loop {
-        log_info(&format!("Connecting to server tunnel {}", client.server_tunnel));
+        log_info(&format!(
+            "Connecting to server tunnel {} (session {})",
+            client.server_tunnel, session_id
+        ));
         match TcpStream::connect(&client.server_tunnel).await {
             Ok(mut tunnel_stream) => {
+                let _ = tunnel_stream.set_nodelay(true);
                 delay = reconnect_delay_ms;
                 if let Err(e) = client_handshake(&mut tunnel_stream, &psk).await {
                     eprintln!("Handshake failed: {e}");
                     continue;
                 }
-                log_info("Tunnel connected to server");
+                log_info(&format!("Tunnel connected to server (session {})", session_id));
                 let (read_half, write_half) = tunnel_stream.into_split();
                 let (tx, rx) = mpsc::channel::<Frame>(2048);
                 let writer_task = tokio::spawn(tunnel_writer(write_half, rx));

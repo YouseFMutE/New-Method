@@ -19,9 +19,10 @@
 - امنیت ارتباط: PSK (بدون TLS، بدون رمزنگاری دیتا)
   - کلید مشترک (PSK) بین Server/Client
   - احراز هویت: PSK + HMAC (یک‌طرفه)
-- پروتکل انتقال: multiplex داخلی (frame-based)
+- پروتکل انتقال: TCPmux داخلی (frame-based)
   - چند stream روی یک اتصال TCP
   - سربار کم و مناسب برای کانکشن پایدار
+  - امکان چند اتصال هم‌زمان تونل از سمت Client (`mux_con`)
 
 ## معماری
 ### Roles
@@ -32,7 +33,7 @@
 
 ### Data Flow (تک پورت)
 1. Server پورت عمومی را listen می‌کند.
-2. Client به Server متصل می‌شود (PSK + AEAD).
+2. Client به Server متصل می‌شود (PSK + HMAC، بدون رمزنگاری داده).
 3. هر اتصال ورودی به Server در یک کانال منطقی به Client هدایت می‌شود.
 4. Client اتصال را به مقصد نهایی (مثلاً 127.0.0.1:1414) باز می‌کند و داده را رله می‌کند.
 
@@ -48,6 +49,7 @@ mytunnel run
 - دریافت مرحله‌ای اطلاعات:
   - آدرس/پورت‌های listen
   - آدرس/پورت مقصد
+  - تعداد اتصال‌های هم‌زمان تونل (TCPmux)
   - کلید مشترک (PSK) - تولید رندوم یا ورود دستی
   - سیاست‌های اتصال (حداکثر اندازه فریم، نرخ تلاش مجدد)
 
@@ -81,8 +83,6 @@ mytunnel run
   - ClientHello: نسخه + nonce (24 بایت)
   - ServerHello: nonce (24 بایت) + HMAC(psk, client_nonce || server_nonce)
   - ClientAck: HMAC(psk, server_nonce || client_nonce)
-- Session Key:
-  - HKDF(psk, salt=client_nonce||server_nonce, info="tunnel-v1-keys")
 - Data:
   - انتقال داده از طریق فریم‌های داخلی multiplex
   - داده‌ها **رمزنگاری نمی‌شوند**
