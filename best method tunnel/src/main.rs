@@ -13,7 +13,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::{
-    io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt},
+    io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::Mutex,
 };
@@ -526,7 +526,10 @@ async fn keepalive_loop(control: Arc<Mutex<Control>>) {
     }
 }
 
-async fn handle_inbound_keepalive(mut stream: tokio_yamux::Stream) -> Result<()> {
+async fn handle_inbound_keepalive<S>(mut stream: S) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let mut kind = [0u8; 1];
     if stream.read_exact(&mut kind).await.is_err() {
         return Ok(());
@@ -539,7 +542,10 @@ async fn handle_inbound_keepalive(mut stream: tokio_yamux::Stream) -> Result<()>
     Ok(())
 }
 
-async fn drain_stream(mut stream: tokio_yamux::Stream) -> Result<()> {
+async fn drain_stream<S>(mut stream: S) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let mut buf = [0u8; 256];
     loop {
         match stream.read(&mut buf).await {
