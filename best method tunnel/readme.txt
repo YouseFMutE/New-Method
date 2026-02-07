@@ -119,3 +119,8 @@ Client:
 همچنین:
   systemctl status mytunnel
   journalctl -u mytunnel -f
+
+11) دیباگ (اختیاری)
+--------------------
+برای لاگ بیشتر:
+  MYTUNNEL_DEBUG=1 /usr/local/bin/mytunnel run --config /etc/mytunnel/config.toml

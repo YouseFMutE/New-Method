@@ -282,6 +282,10 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], max_frame_size: usize) 
                         continue;
                     }
                 };
+                let peer = tunnel_stream
+                    .peer_addr()
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|_| "unknown".into());
                 let session = match server_handshake(&mut tunnel_stream, &psk).await {
                     Ok(s) => s,
                     Err(e) => {
@@ -289,6 +293,7 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], max_frame_size: usize) 
                         continue;
                     }
                 };
+                log_info(&format!("Tunnel connected from {}", peer));
                 let (tunnel_reader, tunnel_writer) = tunnel_stream.into_split();
                 let writer_tx = spawn_tunnel_writer(tunnel_writer, session.s2c);
                 *tunnel_sender.lock().await = Some(writer_tx.clone());
@@ -358,6 +363,7 @@ async fn run_client(
                 delay = reconnect_delay_ms;
                 match client_handshake(&mut tunnel_stream, &psk).await {
                     Ok(session) => {
+                        log_info("Tunnel connected to server");
                         let (tunnel_reader, tunnel_writer) = tunnel_stream.into_split();
                         let writer_tx = spawn_tunnel_writer(tunnel_writer, session.c2s);
                         let stream_map: Arc<Mutex<HashMap<u32, mpsc::Sender<Vec<u8>>>>> =
@@ -448,6 +454,12 @@ async fn tunnel_reader_loop(
             FRAME_DATA => {
                 if let Some(tx) = stream_map.lock().await.get(&frame.stream_id).cloned() {
                     let _ = tx.send(frame.payload).await;
+                } else {
+                    log_debug(&format!(
+                        "DATA for unknown stream {} (len={})",
+                        frame.stream_id,
+                        frame.payload.len()
+                    ));
                 }
             }
             FRAME_CLOSE => {
@@ -475,6 +487,7 @@ async fn tunnel_reader_loop_client(
         match frame.ftype {
             FRAME_OPEN => {
                 let stream_id = frame.stream_id;
+                log_info(&format!("OPEN stream {}", stream_id));
                 let socket = TcpStream::connect(&target).await?;
                 let (tx_to_sock, rx_to_sock) = mpsc::channel::<Vec<u8>>(64);
                 stream_map.lock().await.insert(stream_id, tx_to_sock);
@@ -500,6 +513,12 @@ async fn tunnel_reader_loop_client(
             FRAME_DATA => {
                 if let Some(tx) = stream_map.lock().await.get(&frame.stream_id).cloned() {
                     let _ = tx.send(frame.payload).await;
+                } else {
+                    log_debug(&format!(
+                        "DATA for unknown stream {} (len={})",
+                        frame.stream_id,
+                        frame.payload.len()
+                    ));
                 }
             }
             FRAME_CLOSE => {
@@ -798,4 +817,10 @@ fn log_info(msg: &str) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     println!("[{ts}] {msg}");
+}
+
+fn log_debug(msg: &str) {
+    if std::env::var("MYTUNNEL_DEBUG").ok().as_deref() == Some("1") {
+        log_info(msg);
+    }
 }
