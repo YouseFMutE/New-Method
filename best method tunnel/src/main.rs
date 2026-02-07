@@ -281,11 +281,25 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], max_frame_size: usize) 
                 *control.lock().await = Some(Arc::new(Mutex::new(yamux.control())));
 
                 while let Some(res) = yamux.next().await {
-                    if let Err(e) = res {
-                        eprintln!("Yamux error: {e}");
-                        break;
+                    match res {
+                        Ok(mut stream) => {
+                            // Drain and drop keepalive or unexpected inbound streams.
+                            tokio::spawn(async move {
+                                let mut buf = [0u8; 64];
+                                loop {
+                                    match stream.read(&mut buf).await {
+                                        Ok(0) => break,
+                                        Ok(_) => continue,
+                                        Err(_) => break,
+                                    }
+                                }
+                            });
+                        }
+                        Err(e) => {
+                            eprintln!("Yamux error: {e}");
+                            break;
+                        }
                     }
-                    // Server side shouldn't receive inbound streams; ignore.
                 }
 
                 *control.lock().await = None;
@@ -360,6 +374,8 @@ async fn run_client(
                     yamux_config(max_frame_size),
                     SessionType::Client,
                 );
+                let keepalive_control = Arc::new(Mutex::new(yamux.control()));
+                let keepalive_task = tokio::spawn(keepalive_loop(Arc::clone(&keepalive_control)));
                 while let Some(res) = yamux.next().await {
                     match res {
                         Ok(stream) => {
@@ -390,6 +406,7 @@ async fn run_client(
                         }
                     }
                 }
+                keepalive_task.abort();
             }
             Err(e) => {
                 eprintln!("Connect failed: {e}");
@@ -475,13 +492,25 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn yamux_config(max_frame_size: usize) -> YamuxConfig {
-    let mut cfg = YamuxConfig::default();
-    if max_frame_size > 0 {
-        cfg.set_max_frame_size(max_frame_size as u32);
+fn yamux_config(_max_frame_size: usize) -> YamuxConfig {
+    // tokio-yamux 0.3 doesn't expose frame/timeout tuning; keep defaults.
+    YamuxConfig::default()
+}
+
+async fn keepalive_loop(control: Arc<Mutex<Control>>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        let stream_res = {
+            let mut ctrl = control.lock().await;
+            ctrl.open_stream().await
+        };
+        match stream_res {
+            Ok(mut stream) => {
+                let _ = stream.shutdown().await;
+            }
+            Err(_) => break,
+        }
     }
-    cfg.set_connection_timeout(Duration::from_secs(600));
-    cfg
 }
 
 fn log_info(msg: &str) {
