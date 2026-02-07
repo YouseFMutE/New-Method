@@ -12,11 +12,11 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::{
-    io::copy_bidirectional,
+    io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     sync::Mutex,
 };
-use yamux::{Config as YamuxConfig, Connection, Mode};
+use tokio_yamux::{Config as YamuxConfig, Connection, Control, Mode};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -235,14 +235,17 @@ fn load_config(path: &PathBuf) -> Result<Config> {
 }
 
 async fn run_server(server: ServerConfig, psk: [u8; 32]) -> Result<()> {
-    let tunnel_listener = TcpListener::bind(&server.tunnel_listen)
-        .await
-        .with_context(|| format!("Bind tunnel listener {}", server.tunnel_listen))?;
-    let public_listener = TcpListener::bind(&server.public_listen)
-        .await
-        .with_context(|| format!("Bind public listener {}", server.public_listen))?;
+    let tunnel_listen = server.tunnel_listen.clone();
+    let public_listen = server.public_listen.clone();
 
-    let control: Arc<Mutex<Option<yamux::Control>>> = Arc::new(Mutex::new(None));
+    let tunnel_listener = TcpListener::bind(&tunnel_listen)
+        .await
+        .with_context(|| format!("Bind tunnel listener {}", tunnel_listen))?;
+    let public_listener = TcpListener::bind(&public_listen)
+        .await
+        .with_context(|| format!("Bind public listener {}", public_listen))?;
+
+    let control: Arc<Mutex<Option<Arc<Control>>>> = Arc::new(Mutex::new(None));
 
     // Accept tunnel connection in background.
     {
@@ -251,7 +254,7 @@ async fn run_server(server: ServerConfig, psk: [u8; 32]) -> Result<()> {
             loop {
                 log_info(&format!(
                     "Waiting for client tunnel on {}",
-                    server.tunnel_listen
+                    tunnel_listen
                 ));
                 let (mut tunnel_stream, _) = match tunnel_listener.accept().await {
                     Ok(v) => v,
@@ -271,7 +274,7 @@ async fn run_server(server: ServerConfig, psk: [u8; 32]) -> Result<()> {
                 log_info(&format!("Tunnel connected from {}", peer));
 
                 let mut yamux = Connection::new(tunnel_stream, YamuxConfig::default(), Mode::Server);
-                *control.lock().await = Some(yamux.control());
+                *control.lock().await = Some(Arc::new(yamux.control()));
 
                 while let Some(res) = yamux.next().await {
                     if let Err(e) = res {
@@ -286,7 +289,7 @@ async fn run_server(server: ServerConfig, psk: [u8; 32]) -> Result<()> {
         });
     }
 
-    log_info(&format!("Public listen on {}", server.public_listen));
+    log_info(&format!("Public listen on {}", public_listen));
     loop {
         let (mut socket, _) = public_listener.accept().await?;
         let control_opt = control.lock().await.clone();
