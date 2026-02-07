@@ -23,6 +23,8 @@ use tokio_yamux::session::SessionType;
 type HmacSha256 = Hmac<Sha256>;
 
 const HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
+const STREAM_KIND_KEEPALIVE: u8 = 0x00;
+const STREAM_KIND_DATA: u8 = 0x01;
 
 const NONCE_LEN: usize = 24;
 const MAC_LEN: usize = 32;
@@ -280,19 +282,13 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], max_frame_size: usize) 
                 );
                 *control.lock().await = Some(Arc::new(Mutex::new(yamux.control())));
 
+                let keepalive_control = Arc::new(Mutex::new(yamux.control()));
+                let keepalive_task = tokio::spawn(keepalive_loop(Arc::clone(&keepalive_control)));
                 while let Some(res) = yamux.next().await {
                     match res {
                         Ok(mut stream) => {
-                            // Drain and drop keepalive or unexpected inbound streams.
                             tokio::spawn(async move {
-                                let mut buf = [0u8; 64];
-                                loop {
-                                    match stream.read(&mut buf).await {
-                                        Ok(0) => break,
-                                        Ok(_) => continue,
-                                        Err(_) => break,
-                                    }
-                                }
+                                let _ = handle_inbound_keepalive(stream).await;
                             });
                         }
                         Err(e) => {
@@ -303,6 +299,7 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], max_frame_size: usize) 
                 }
 
                 *control.lock().await = None;
+                keepalive_task.abort();
                 log_info("Tunnel disconnected");
             }
         });
@@ -331,9 +328,12 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], max_frame_size: usize) 
                 ctrl.open_stream().await
             };
             match stream_res {
-                Ok(stream) => {
+                Ok(mut stream) => {
                     log_debug(&format!("Opened tunnel stream for {}", peer));
-                    let mut stream = stream;
+                    if let Err(e) = stream.write_all(&[STREAM_KIND_DATA]).await {
+                        eprintln!("Failed to write stream header for {peer}: {e}");
+                        return;
+                    }
                     match copy_bidirectional(&mut socket, &mut stream).await {
                         Ok((a, b)) => log_debug(&format!(
                             "Public {} closed (up {} bytes, down {} bytes)",
@@ -378,8 +378,20 @@ async fn run_client(
                 let keepalive_task = tokio::spawn(keepalive_loop(Arc::clone(&keepalive_control)));
                 while let Some(res) = yamux.next().await {
                     match res {
-                        Ok(stream) => {
-                            log_debug("Inbound stream from server");
+                        Ok(mut stream) => {
+                            let mut kind = [0u8; 1];
+                            if let Err(e) = stream.read_exact(&mut kind).await {
+                                eprintln!("Stream header read failed: {e}");
+                                continue;
+                            }
+                            if kind[0] == STREAM_KIND_KEEPALIVE {
+                                log_debug("Keepalive stream received");
+                                tokio::spawn(async move {
+                                    let _ = drain_stream(stream).await;
+                                });
+                                continue;
+                            }
+                            log_debug("Inbound data stream from server");
                             let target = client.target.clone();
                             tokio::spawn(async move {
                                 match TcpStream::connect(&target).await {
@@ -506,11 +518,37 @@ async fn keepalive_loop(control: Arc<Mutex<Control>>) {
         };
         match stream_res {
             Ok(mut stream) => {
+                let _ = stream.write_all(&[STREAM_KIND_KEEPALIVE]).await;
                 let _ = stream.shutdown().await;
             }
             Err(_) => break,
         }
     }
+}
+
+async fn handle_inbound_keepalive(mut stream: tokio_yamux::Stream) -> Result<()> {
+    let mut kind = [0u8; 1];
+    if stream.read_exact(&mut kind).await.is_err() {
+        return Ok(());
+    }
+    if kind[0] == STREAM_KIND_KEEPALIVE {
+        drain_stream(stream).await?;
+    } else {
+        drain_stream(stream).await?;
+    }
+    Ok(())
+}
+
+async fn drain_stream(mut stream: tokio_yamux::Stream) -> Result<()> {
+    let mut buf = [0u8; 256];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    Ok(())
 }
 
 fn log_info(msg: &str) {
