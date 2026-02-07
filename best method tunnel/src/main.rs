@@ -505,8 +505,12 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 }
 
 fn yamux_config(_max_frame_size: usize) -> YamuxConfig {
-    // tokio-yamux 0.3 doesn't expose frame/timeout tuning; keep defaults.
-    YamuxConfig::default()
+    let mut cfg = YamuxConfig::default();
+    cfg.enable_keepalive = true;
+    cfg.keepalive_interval = Duration::from_secs(15);
+    cfg.connection_write_timeout = Duration::from_secs(600);
+    cfg.max_stream_window_size = 256 * 1024;
+    cfg
 }
 
 async fn keepalive_loop(control: Arc<Mutex<Control>>) {
