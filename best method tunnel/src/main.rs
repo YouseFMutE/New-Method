@@ -16,8 +16,8 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::Mutex,
 };
-use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
-use yamux::{Config as YamuxConfig, Connection, Control, Mode};
+use tokio_yamux::{Config as YamuxConfig, Control, Session};
+use tokio_yamux::session::SessionType;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -274,8 +274,7 @@ async fn run_server(server: ServerConfig, psk: [u8; 32]) -> Result<()> {
                 }
                 log_info(&format!("Tunnel connected from {}", peer));
 
-                let tunnel_stream = tunnel_stream.compat();
-                let mut yamux = Connection::new(tunnel_stream, YamuxConfig::default(), Mode::Server);
+                let mut yamux = Session::new(tunnel_stream, YamuxConfig::default(), SessionType::Server);
                 *control.lock().await = Some(Arc::new(Mutex::new(yamux.control())));
 
                 while let Some(res) = yamux.next().await {
@@ -310,7 +309,7 @@ async fn run_server(server: ServerConfig, psk: [u8; 32]) -> Result<()> {
             };
             match stream_res {
                 Ok(stream) => {
-                    let mut stream = stream.compat();
+                    let mut stream = stream;
                     let _ = copy_bidirectional(&mut socket, &mut stream).await;
                 }
                 Err(e) => {
@@ -339,8 +338,7 @@ async fn run_client(
                 }
                 log_info("Tunnel connected to server");
 
-                let tunnel_stream = tunnel_stream.compat();
-                let mut yamux = Connection::new(tunnel_stream, YamuxConfig::default(), Mode::Client);
+                let mut yamux = Session::new(tunnel_stream, YamuxConfig::default(), SessionType::Client);
                 while let Some(res) = yamux.next().await {
                     match res {
                         Ok(stream) => {
@@ -348,7 +346,7 @@ async fn run_client(
                             tokio::spawn(async move {
                                 match TcpStream::connect(&target).await {
                                     Ok(mut target_sock) => {
-                                        let mut stream = stream.compat();
+                                        let mut stream = stream;
                                         let _ = copy_bidirectional(&mut stream, &mut target_sock).await;
                                     }
                                     Err(e) => {
