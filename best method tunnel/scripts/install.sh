@@ -9,7 +9,6 @@ fi
 REPO_URL="${REPO_URL:-https://github.com/YouseFMutE/New-Method.git}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/mytunnel}"
 PROJECT_SUBDIR="${PROJECT_SUBDIR:-best method tunnel}"
-CONFIG_TEMPLATE="${CONFIG_TEMPLATE:-}"
 
 apt-get update -y
 apt-get install -y curl git build-essential pkg-config
@@ -35,4 +34,4 @@ if [[ ! -d "$PROJECT_DIR" ]]; then
   exit 1
 fi
 
-CONFIG_TEMPLATE="$CONFIG_TEMPLATE" bash "$PROJECT_DIR/scripts/first_run.sh"
+bash "$PROJECT_DIR/scripts/first_run.sh"

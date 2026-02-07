@@ -122,6 +122,11 @@ struct SessionKeys {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    log_info(&format!(
+        "mytunnel v{} build {}",
+        env!("CARGO_PKG_VERSION"),
+        option_env!("MYTUNNEL_BUILD").unwrap_or("unknown")
+    ));
     match cli.command {
         Commands::Init { config } => run_init(config),
         Commands::Run { config } => run(config).await,

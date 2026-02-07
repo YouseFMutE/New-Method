@@ -12,7 +12,6 @@ BIN_DEFAULT="/usr/local/bin/mytunnel"
 CONFIG_DIR="/etc/mytunnel"
 CONFIG_FILE="${CONFIG_DIR}/config.toml"
 SERVICE_FILE="/etc/systemd/system/mytunnel.service"
-TEMPLATE_DIR="$ROOT_DIR/configs"
 LOG_DIR="/var/log/mytunnel"
 LOG_FILE="$LOG_DIR/mytunnel.log"
 
@@ -52,22 +51,12 @@ mkdir -p "$LOG_DIR"
 touch "$LOG_FILE"
 chmod 0644 "$LOG_FILE"
 if [[ -f "$CONFIG_FILE" ]]; then
-  echo "Config already exists at $CONFIG_FILE"
-else
-  case "${CONFIG_TEMPLATE:-}" in
-    server)
-      cp "$TEMPLATE_DIR/server.example.toml" "$CONFIG_FILE"
-      echo "Copied server template to $CONFIG_FILE"
-      ;;
-    client)
-      cp "$TEMPLATE_DIR/client.example.toml" "$CONFIG_FILE"
-      echo "Copied client template to $CONFIG_FILE"
-      ;;
-    *)
-      "$BIN_PATH" init --config "$CONFIG_FILE"
-      ;;
-  esac
+  TS=$(date +%s)
+  mv "$CONFIG_FILE" "${CONFIG_FILE}.bak.${TS}"
+  echo "Existing config backed up to ${CONFIG_FILE}.bak.${TS}"
 fi
+
+"$BIN_PATH" init --config "$CONFIG_FILE"
 
 cat > "$SERVICE_FILE" <<EOF
 [Unit]

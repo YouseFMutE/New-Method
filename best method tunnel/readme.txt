@@ -22,11 +22,10 @@
 
 2.1) نصب تک‌خطی (پیشنهادی)
 ---------------------------
-Server:
-  CONFIG_TEMPLATE=server bash <(curl -fsSL https://raw.githubusercontent.com/YouseFMutE/New-Method/main/best%20method%20tunnel/scripts/install.sh)
+روی هر سرور:
+  bash <(curl -fsSL https://raw.githubusercontent.com/YouseFMutE/New-Method/main/best%20method%20tunnel/scripts/install.sh)
 
-Client:
-  CONFIG_TEMPLATE=client bash <(curl -fsSL https://raw.githubusercontent.com/YouseFMutE/New-Method/main/best%20method%20tunnel/scripts/install.sh)
+این نصب، پرسش‌نامه CLI را اجرا می‌کند تا نقش (Server/Client) و تنظیمات را وارد کنید.
 
 3) اجرای اولیه (مرحله‌ای)
 --------------------------
@@ -66,13 +65,7 @@ Client:
 - سرویس systemd می‌سازد و اجرا می‌کند
  - لاگ را در /var/log/mytunnel/mytunnel.log ذخیره می‌کند
 
-قالب‌های آماده کانفیگ:
-  /PATH/TO/configs/server.example.toml
-  /PATH/TO/configs/client.example.toml
-
-برای استفاده سریع از قالب:
-  CONFIG_TEMPLATE=server sudo /PATH/TO/scripts/first_run.sh
-  CONFIG_TEMPLATE=client sudo /PATH/TO/scripts/first_run.sh
+در نصب جدید، **همیشه** پرسش‌نامه CLI اجرا می‌شود و از شما مرحله‌به‌مرحله تنظیمات را می‌گیرد.
 
 6) تست سریع
 ------------
