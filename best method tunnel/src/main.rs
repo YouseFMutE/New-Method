@@ -324,30 +324,40 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], _max_frame_size: usize)
                 });
                 sessions.lock().await.push(Arc::clone(&session));
 
-                let writer_task = tokio::spawn(tunnel_writer(write_half, rx));
-                let reader_task =
-                    tokio::spawn(tunnel_reader_server(read_half, Arc::clone(&session.conns), tx));
+                let mut writer_task = tokio::spawn(tunnel_writer(write_half, rx));
+                let mut reader_task = tokio::spawn(tunnel_reader_server(
+                    read_half,
+                    Arc::clone(&session.conns),
+                    tx,
+                ));
                 let keepalive_task = tokio::spawn(keepalive_loop(session.tx.clone()));
 
-                match reader_task.await {
-                    Ok(Ok(())) => {
-                        log_debug("Tunnel reader finished");
+                tokio::select! {
+                    res = &mut reader_task => {
+                        match res {
+                            Ok(Ok(())) => log_debug("Tunnel reader finished"),
+                            Ok(Err(e)) => eprintln!("Tunnel reader error: {e}"),
+                            Err(e) => eprintln!("Tunnel reader join error: {e}"),
+                        }
                     }
-                    Ok(Err(e)) => {
-                        eprintln!("Tunnel reader error: {e}");
-                    }
-                    Err(e) => {
-                        eprintln!("Tunnel reader join error: {e}");
+                    res = &mut writer_task => {
+                        match res {
+                            Ok(Ok(())) => log_debug("Tunnel writer finished"),
+                            Ok(Err(e)) => eprintln!("Tunnel writer error: {e}"),
+                            Err(e) => eprintln!("Tunnel writer join error: {e}"),
+                        }
                     }
                 }
-                writer_task.abort();
+
                 keepalive_task.abort();
+                reader_task.abort();
+                writer_task.abort();
 
                 {
                     let mut list = sessions.lock().await;
                     list.retain(|s| s.id != session.id);
                 }
-                session.conns.lock().await.clear();
+                close_all_conns(&session.conns).await;
                 log_info("Tunnel disconnected");
             }
         });
@@ -462,8 +472,8 @@ async fn run_client_session(
                 log_info(&format!("Tunnel connected to server (session {})", session_id));
                 let (read_half, write_half) = tunnel_stream.into_split();
                 let (tx, rx) = mpsc::channel::<Frame>(2048);
-                let writer_task = tokio::spawn(tunnel_writer(write_half, rx));
-                let reader_task = tokio::spawn(tunnel_reader_client(
+                let mut writer_task = tokio::spawn(tunnel_writer(write_half, rx));
+                let mut reader_task = tokio::spawn(tunnel_reader_client(
                     read_half,
                     Arc::clone(&connections),
                     tx.clone(),
@@ -471,23 +481,27 @@ async fn run_client_session(
                 ));
                 let keepalive_task = tokio::spawn(keepalive_loop(tx.clone()));
 
-                match reader_task.await {
-                    Ok(Ok(())) => {
-                        log_debug(&format!(
-                            "Tunnel reader finished (session {})",
-                            session_id
-                        ));
+                tokio::select! {
+                    res = &mut reader_task => {
+                        match res {
+                            Ok(Ok(())) => log_debug(&format!("Tunnel reader finished (session {})", session_id)),
+                            Ok(Err(e)) => eprintln!("Tunnel reader error (session {}): {e}", session_id),
+                            Err(e) => eprintln!("Tunnel reader join error (session {}): {e}", session_id),
+                        }
                     }
-                    Ok(Err(e)) => {
-                        eprintln!("Tunnel reader error (session {}): {e}", session_id);
-                    }
-                    Err(e) => {
-                        eprintln!("Tunnel reader join error (session {}): {e}", session_id);
+                    res = &mut writer_task => {
+                        match res {
+                            Ok(Ok(())) => log_debug(&format!("Tunnel writer finished (session {})", session_id)),
+                            Ok(Err(e)) => eprintln!("Tunnel writer error (session {}): {e}", session_id),
+                            Err(e) => eprintln!("Tunnel writer join error (session {}): {e}", session_id),
+                        }
                     }
                 }
-                writer_task.abort();
+
                 keepalive_task.abort();
-                connections.lock().await.clear();
+                reader_task.abort();
+                writer_task.abort();
+                close_all_conns(&connections).await;
             }
             Err(e) => {
                 eprintln!("Connect failed: {e}");
@@ -500,12 +514,11 @@ async fn run_client_session(
     }
 }
 
-async fn tunnel_writer(mut writer: OwnedWriteHalf, mut rx: mpsc::Receiver<Frame>) {
+async fn tunnel_writer(mut writer: OwnedWriteHalf, mut rx: mpsc::Receiver<Frame>) -> Result<()> {
     while let Some(frame) = rx.recv().await {
-        if write_frame(&mut writer, &frame).await.is_err() {
-            break;
-        }
+        write_frame(&mut writer, &frame).await?;
     }
+    Ok(())
 }
 
 async fn keepalive_loop(tx: mpsc::Sender<Frame>) {
@@ -539,7 +552,7 @@ async fn tunnel_reader_server(
                     let mut w = conn.writer.lock().await;
                     if let Err(e) = w.write_all(&frame.data).await {
                         eprintln!("Write to public failed: {e}");
-                        conns.lock().await.remove(&frame.id);
+                        close_conn(&conns, frame.id).await;
                         let _ = tx
                             .send(Frame {
                                 kind: FRAME_CLOSE,
@@ -563,7 +576,7 @@ async fn tunnel_reader_server(
                 }
             }
             FRAME_CLOSE => {
-                conns.lock().await.remove(&frame.id);
+                close_conn(&conns, frame.id).await;
             }
             FRAME_KEEPALIVE => {}
             FRAME_OPEN => {}
@@ -617,7 +630,7 @@ async fn tunnel_reader_client(
                     let mut w = conn.writer.lock().await;
                     if let Err(e) = w.write_all(&frame.data).await {
                         eprintln!("Write to target failed: {e}");
-                        conns.lock().await.remove(&frame.id);
+                        close_conn(&conns, frame.id).await;
                         let _ = tx
                             .send(Frame {
                                 kind: FRAME_CLOSE,
@@ -644,7 +657,7 @@ async fn tunnel_reader_client(
             }
             FRAME_CLOSE => {
                 log_debug(&format!("RX CLOSE id={}", frame.id));
-                conns.lock().await.remove(&frame.id);
+                close_conn(&conns, frame.id).await;
             }
             FRAME_KEEPALIVE => {}
             _ => {}
@@ -701,7 +714,7 @@ async fn pump_socket_to_tunnel(
                             data: Vec::new(),
                         })
                         .await;
-                    conns.lock().await.remove(&id);
+                    close_conn(&conns, id).await;
                     return;
                 }
             }
@@ -713,11 +726,28 @@ async fn pump_socket_to_tunnel(
                         data: Vec::new(),
                     })
                     .await;
-                conns.lock().await.remove(&id);
+                close_conn(&conns, id).await;
                 return;
             }
         }
     }
+}
+
+async fn close_conn(conns: &ConnMap, id: u32) {
+    let conn = { conns.lock().await.remove(&id) };
+    if let Some(conn) = conn {
+        let mut w = conn.writer.lock().await;
+        let _ = w.shutdown().await;
+    }
+}
+
+async fn close_all_conns(conns: &ConnMap) {
+    let list = { conns.lock().await.values().cloned().collect::<Vec<_>>() };
+    for conn in list {
+        let mut w = conn.writer.lock().await;
+        let _ = w.shutdown().await;
+    }
+    conns.lock().await.clear();
 }
 
 async fn write_frame(writer: &mut OwnedWriteHalf, frame: &Frame) -> Result<()> {
