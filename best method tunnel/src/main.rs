@@ -1,6 +1,7 @@
 use std::{
     path::PathBuf,
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -204,7 +205,7 @@ async fn run(config_path: PathBuf) -> Result<()> {
                 .server
                 .clone()
                 .ok_or_else(|| anyhow!("Missing server config"))?;
-            run_server(server, psk).await
+            run_server(server, psk, config.max_frame_size).await
         }
         Role::Client => {
             let client = config
@@ -214,6 +215,7 @@ async fn run(config_path: PathBuf) -> Result<()> {
             run_client(
                 client,
                 psk,
+                config.max_frame_size,
                 config.reconnect_delay_ms,
                 config.reconnect_max_delay_ms,
             )
@@ -232,7 +234,7 @@ fn load_config(path: &PathBuf) -> Result<Config> {
     Ok(config)
 }
 
-async fn run_server(server: ServerConfig, psk: [u8; 32]) -> Result<()> {
+async fn run_server(server: ServerConfig, psk: [u8; 32], max_frame_size: usize) -> Result<()> {
     let tunnel_listen = server.tunnel_listen.clone();
     let public_listen = server.public_listen.clone();
 
@@ -271,7 +273,11 @@ async fn run_server(server: ServerConfig, psk: [u8; 32]) -> Result<()> {
                 }
                 log_info(&format!("Tunnel connected from {}", peer));
 
-                let mut yamux = Session::new(tunnel_stream, YamuxConfig::default(), SessionType::Server);
+                let mut yamux = Session::new(
+                    tunnel_stream,
+                    yamux_config(max_frame_size),
+                    SessionType::Server,
+                );
                 *control.lock().await = Some(Arc::new(Mutex::new(yamux.control())));
 
                 while let Some(res) = yamux.next().await {
@@ -333,6 +339,7 @@ async fn run_server(server: ServerConfig, psk: [u8; 32]) -> Result<()> {
 async fn run_client(
     client: ClientConfig,
     psk: [u8; 32],
+    max_frame_size: usize,
     reconnect_delay_ms: u64,
     reconnect_max_delay_ms: u64,
 ) -> Result<()> {
@@ -348,7 +355,11 @@ async fn run_client(
                 }
                 log_info("Tunnel connected to server");
 
-                let mut yamux = Session::new(tunnel_stream, YamuxConfig::default(), SessionType::Client);
+                let mut yamux = Session::new(
+                    tunnel_stream,
+                    yamux_config(max_frame_size),
+                    SessionType::Client,
+                );
                 while let Some(res) = yamux.next().await {
                     match res {
                         Ok(stream) => {
@@ -462,6 +473,15 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= a[i] ^ b[i];
     }
     diff == 0
+}
+
+fn yamux_config(max_frame_size: usize) -> YamuxConfig {
+    let mut cfg = YamuxConfig::default();
+    if max_frame_size > 0 {
+        cfg.set_max_frame_size(max_frame_size as u32);
+    }
+    cfg.set_connection_timeout(Duration::from_secs(600));
+    cfg
 }
 
 fn log_info(msg: &str) {
