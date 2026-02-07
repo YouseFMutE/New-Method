@@ -16,7 +16,8 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::Mutex,
 };
-use tokio_yamux::{Config as YamuxConfig, Connection, Control, Mode};
+use tokio_util::compat::{FuturesAsyncReadCompatExt, TokioAsyncReadCompatExt};
+use yamux::{Config as YamuxConfig, Connection, Control, Mode};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -245,7 +246,7 @@ async fn run_server(server: ServerConfig, psk: [u8; 32]) -> Result<()> {
         .await
         .with_context(|| format!("Bind public listener {}", public_listen))?;
 
-    let control: Arc<Mutex<Option<Arc<Control>>>> = Arc::new(Mutex::new(None));
+    let control: Arc<Mutex<Option<Arc<Mutex<Control>>>>> = Arc::new(Mutex::new(None));
 
     // Accept tunnel connection in background.
     {
@@ -273,8 +274,9 @@ async fn run_server(server: ServerConfig, psk: [u8; 32]) -> Result<()> {
                 }
                 log_info(&format!("Tunnel connected from {}", peer));
 
+                let tunnel_stream = tunnel_stream.compat();
                 let mut yamux = Connection::new(tunnel_stream, YamuxConfig::default(), Mode::Server);
-                *control.lock().await = Some(Arc::new(yamux.control()));
+                *control.lock().await = Some(Arc::new(Mutex::new(yamux.control())));
 
                 while let Some(res) = yamux.next().await {
                     if let Err(e) = res {
@@ -302,8 +304,13 @@ async fn run_server(server: ServerConfig, psk: [u8; 32]) -> Result<()> {
         };
 
         tokio::spawn(async move {
-            match control.open_stream().await {
-                Ok(mut stream) => {
+            let stream_res = {
+                let mut ctrl = control.lock().await;
+                ctrl.open_stream().await
+            };
+            match stream_res {
+                Ok(stream) => {
+                    let mut stream = stream.compat();
                     let _ = copy_bidirectional(&mut socket, &mut stream).await;
                 }
                 Err(e) => {
@@ -332,14 +339,16 @@ async fn run_client(
                 }
                 log_info("Tunnel connected to server");
 
+                let tunnel_stream = tunnel_stream.compat();
                 let mut yamux = Connection::new(tunnel_stream, YamuxConfig::default(), Mode::Client);
                 while let Some(res) = yamux.next().await {
                     match res {
-                        Ok(mut stream) => {
+                        Ok(stream) => {
                             let target = client.target.clone();
                             tokio::spawn(async move {
                                 match TcpStream::connect(&target).await {
                                     Ok(mut target_sock) => {
+                                        let mut stream = stream.compat();
                                         let _ = copy_bidirectional(&mut stream, &mut target_sock).await;
                                     }
                                     Err(e) => {
