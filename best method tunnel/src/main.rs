@@ -22,9 +22,6 @@ use tokio_yamux::session::SessionType;
 type HmacSha256 = Hmac<Sha256>;
 
 const HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
-const HANDSHAKE_SERVER_HELLO: u8 = 0x02;
-const HANDSHAKE_CLIENT_ACK: u8 = 0x03;
-const HANDSHAKE_SERVER_OK: u8 = 0x04;
 
 const NONCE_LEN: usize = 24;
 const MAC_LEN: usize = 32;
@@ -403,41 +400,17 @@ async fn server_handshake(stream: &mut TcpStream, psk: &[u8; 32]) -> Result<()> 
     }
     let mut client_nonce = [0u8; NONCE_LEN];
     stream.read_exact(&mut client_nonce).await?;
-    log_debug("Handshake: got client hello");
-
-    let mut server_nonce = [0u8; NONCE_LEN];
-    rand::rngs::OsRng.fill_bytes(&mut server_nonce);
-
-    let mut data = Vec::with_capacity(6 + NONCE_LEN * 2);
-    data.extend_from_slice(b"server");
-    data.extend_from_slice(&client_nonce);
-    data.extend_from_slice(&server_nonce);
-    let server_mac = hmac_tag(psk, &data);
-
-    stream.write_all(&[HANDSHAKE_SERVER_HELLO]).await?;
-    stream.write_all(&server_nonce).await?;
-    stream.write_all(&server_mac).await?;
-    log_debug("Handshake: sent server hello");
-
-    stream.read_exact(&mut msg_type).await?;
-    if msg_type[0] != HANDSHAKE_CLIENT_ACK {
-        bail!("Unexpected handshake");
-    }
     let mut client_mac = [0u8; MAC_LEN];
     stream.read_exact(&mut client_mac).await?;
-    log_debug("Handshake: got client ack");
+    log_debug("Handshake: got client hello");
 
-    let mut data = Vec::with_capacity(6 + NONCE_LEN * 2);
+    let mut data = Vec::with_capacity(6 + NONCE_LEN);
     data.extend_from_slice(b"client");
-    data.extend_from_slice(&server_nonce);
     data.extend_from_slice(&client_nonce);
     let expected = hmac_tag(psk, &data);
     if !ct_eq(&expected, &client_mac) {
         bail!("Handshake auth failed");
     }
-
-    stream.write_all(&[HANDSHAKE_SERVER_OK]).await?;
-    log_debug("Handshake: sent server ok");
     Ok(())
 }
 
@@ -445,45 +418,15 @@ async fn client_handshake(stream: &mut TcpStream, psk: &[u8; 32]) -> Result<()> 
     let mut client_nonce = [0u8; NONCE_LEN];
     rand::rngs::OsRng.fill_bytes(&mut client_nonce);
 
-    stream.write_all(&[HANDSHAKE_CLIENT_HELLO]).await?;
-    stream.write_all(&client_nonce).await?;
-    log_debug("Handshake: sent client hello");
-
-    let mut msg_type = [0u8; 1];
-    stream.read_exact(&mut msg_type).await?;
-    if msg_type[0] != HANDSHAKE_SERVER_HELLO {
-        bail!("Unexpected handshake");
-    }
-    let mut server_nonce = [0u8; NONCE_LEN];
-    stream.read_exact(&mut server_nonce).await?;
-    let mut server_mac = [0u8; MAC_LEN];
-    stream.read_exact(&mut server_mac).await?;
-    log_debug("Handshake: got server hello");
-
-    let mut data = Vec::with_capacity(6 + NONCE_LEN * 2);
-    data.extend_from_slice(b"server");
-    data.extend_from_slice(&client_nonce);
-    data.extend_from_slice(&server_nonce);
-    let expected = hmac_tag(psk, &data);
-    if !ct_eq(&expected, &server_mac) {
-        bail!("Handshake auth failed");
-    }
-
-    let mut data = Vec::with_capacity(6 + NONCE_LEN * 2);
+    let mut data = Vec::with_capacity(6 + NONCE_LEN);
     data.extend_from_slice(b"client");
-    data.extend_from_slice(&server_nonce);
     data.extend_from_slice(&client_nonce);
     let client_mac = hmac_tag(psk, &data);
 
-    stream.write_all(&[HANDSHAKE_CLIENT_ACK]).await?;
+    stream.write_all(&[HANDSHAKE_CLIENT_HELLO]).await?;
+    stream.write_all(&client_nonce).await?;
     stream.write_all(&client_mac).await?;
-    log_debug("Handshake: sent client ack");
-
-    stream.read_exact(&mut msg_type).await?;
-    if msg_type[0] != HANDSHAKE_SERVER_OK {
-        bail!("Handshake failed");
-    }
-    log_debug("Handshake: got server ok");
+    log_debug("Handshake: sent client hello");
     Ok(())
 }
 
