@@ -18,9 +18,10 @@ use sha2::Sha256;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
+    net::tcp::{OwnedReadHalf, OwnedWriteHalf, TcpKeepalive},
     sync::{mpsc, Mutex},
 };
+use tokio::sync::mpsc::error::TrySendError;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -303,7 +304,7 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], _max_frame_size: usize)
                         continue;
                     }
                 };
-                let _ = tunnel_stream.set_nodelay(true);
+                apply_socket_opts(&tunnel_stream);
                 let peer = tunnel_stream
                     .peer_addr()
                     .map(|p| p.to_string())
@@ -366,7 +367,7 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], _max_frame_size: usize)
     log_info(&format!("Public listen on {}", public_listen));
     loop {
         let (socket, _) = public_listener.accept().await?;
-        let _ = socket.set_nodelay(true);
+        apply_socket_opts(&socket);
         let peer = socket
             .peer_addr()
             .map(|p| p.to_string())
@@ -463,7 +464,7 @@ async fn run_client_session(
         ));
         match TcpStream::connect(&client.server_tunnel).await {
             Ok(mut tunnel_stream) => {
-                let _ = tunnel_stream.set_nodelay(true);
+                apply_socket_opts(&tunnel_stream);
                 delay = reconnect_delay_ms;
                 if let Err(e) = client_handshake(&mut tunnel_stream, &psk).await {
                     eprintln!("Handshake failed: {e}");
@@ -523,17 +524,16 @@ async fn tunnel_writer(mut writer: OwnedWriteHalf, mut rx: mpsc::Receiver<Frame>
 
 async fn keepalive_loop(tx: mpsc::Sender<Frame>) {
     loop {
-        tokio::time::sleep(Duration::from_secs(15)).await;
-        if tx
-            .send(Frame {
-                kind: FRAME_KEEPALIVE,
-                id: 0,
-                data: Vec::new(),
-            })
-            .await
-            .is_err()
-        {
-            break;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let frame = Frame {
+            kind: FRAME_KEEPALIVE,
+            id: 0,
+            data: Vec::new(),
+        };
+        match tx.try_send(frame) {
+            Ok(()) => {}
+            Err(TrySendError::Closed(_)) => break,
+            Err(TrySendError::Full(_)) => {}
         }
     }
 }
@@ -599,6 +599,7 @@ async fn tunnel_reader_client(
                 log_debug(&format!("RX OPEN id={} -> target {}", id, target));
                 match TcpStream::connect(&target).await {
                     Ok(socket) => {
+                        apply_socket_opts(&socket);
                         let (read_half, write_half) = socket.into_split();
                         let state = Arc::new(ConnState {
                             writer: Mutex::new(write_half),
@@ -860,4 +861,13 @@ fn log_debug(msg: &str) {
     if std::env::var("MYTUNNEL_DEBUG").is_ok() {
         log_info(msg);
     }
+}
+
+fn apply_socket_opts(stream: &TcpStream) {
+    let _ = stream.set_nodelay(true);
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(30))
+        .with_interval(Duration::from_secs(10))
+        .with_retries(5);
+    let _ = stream.set_keepalive(Some(keepalive));
 }
