@@ -16,14 +16,12 @@
 ## تصمیم‌های فنی (قطعی)
 - زبان: Rust
 - Async runtime: tokio
-- امنیت ارتباط: PSK + AEAD (بدون TLS)
+- امنیت ارتباط: PSK (بدون TLS، بدون رمزنگاری دیتا)
   - کلید مشترک (PSK) بین Server/Client
-  - مشتق‌سازی کلید نشست با HKDF
-  - AEAD: ChaCha20-Poly1305
-- پروتکل داخلی: فریم‌بندی باینری با طول + نوع پیام (رمز شده)
-  - امکان ارسال payload با اندازه‌های مختلف
-  - پشتیبانی از backpressure و محدودیت حافظه
-- احراز هویت: همان PSK (challenge/response مبتنی بر HMAC)
+  - احراز هویت: PSK + HMAC (challenge/response)
+- پروتکل انتقال: tcpmux (yamux)
+  - چند stream روی یک اتصال TCP
+  - سربار کم و مناسب برای کانکشن پایدار
 
 ## معماری
 ### Roles
@@ -69,7 +67,7 @@ mytunnel run
 
 ## Milestones
 1. طراحی پروتکل فریم‌بندی و message types
-2. پیاده‌سازی roleها با TCP + PSK (AEAD)
+2. پیاده‌سازی roleها با TCP + PSK + tcpmux (yamux)
 3. CLI + TUI اولیه
 4. مدیریت کانکشن‌ها و backpressure
 5. تست‌های یکپارچگی و Load test ساده
@@ -86,5 +84,5 @@ mytunnel run
 - Session Key:
   - HKDF(psk, salt=client_nonce||server_nonce, info="tunnel-v1-keys")
 - Data:
-  - فریم‌ها با طول مشخص، سپس AEAD(payload, aad=header)
-  - داده‌ها **رمزنگاری می‌شوند**
+  - انتقال داده از طریق stream های yamux
+  - داده‌ها **رمزنگاری نمی‌شوند**
