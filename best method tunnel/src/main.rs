@@ -333,6 +333,7 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], _max_frame_size: usize)
         };
 
         let id = next_id.fetch_add(1, Ordering::Relaxed);
+        log_debug(&format!("OPEN id={} from {}", id, peer));
         let (read_half, write_half) = socket.into_split();
         let write_arc = Arc::new(Mutex::new(write_half));
         connections.lock().await.insert(id, Arc::clone(&write_arc));
@@ -346,6 +347,7 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], _max_frame_size: usize)
             .await
             .is_err()
         {
+            eprintln!("Failed to send OPEN for id={id}");
             connections.lock().await.remove(&id);
             continue;
         }
@@ -355,6 +357,7 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], _max_frame_size: usize)
         tokio::spawn(async move {
             pump_socket_to_tunnel(read_half, id, tx_clone).await;
             conns.lock().await.remove(&id);
+            log_debug(&format!("CLOSE id={} from {}", id, peer));
         });
     }
 }
@@ -476,6 +479,7 @@ async fn tunnel_reader_client(
         match frame.kind {
             FRAME_OPEN => {
                 let id = frame.id;
+                log_debug(&format!("RX OPEN id={} -> target {}", id, target));
                 match TcpStream::connect(&target).await {
                     Ok(socket) => {
                         let (read_half, write_half) = socket.into_split();
@@ -518,8 +522,12 @@ async fn tunnel_reader_client(
                             .await;
                     }
                 }
+                else {
+                    eprintln!("DATA for unknown id={}", frame.id);
+                }
             }
             FRAME_CLOSE => {
+                log_debug(&format!("RX CLOSE id={}", frame.id));
                 conns.lock().await.remove(&frame.id);
             }
             FRAME_KEEPALIVE => {}
@@ -534,10 +542,15 @@ async fn pump_socket_to_tunnel(
     tx: mpsc::Sender<Frame>,
 ) {
     let mut buf = vec![0u8; 16 * 1024];
+    let mut first = true;
     loop {
         match reader.read(&mut buf).await {
             Ok(0) => break,
             Ok(n) => {
+                if first {
+                    log_debug(&format!("TX DATA id={} bytes={}", id, n));
+                    first = false;
+                }
                 if tx
                     .send(Frame {
                         kind: FRAME_DATA,
