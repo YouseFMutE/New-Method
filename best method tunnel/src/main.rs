@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     path::PathBuf,
     sync::{
-        atomic::{AtomicU32, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc,
     },
     time::Duration,
@@ -29,6 +29,7 @@ const FRAME_OPEN: u8 = 0x01;
 const FRAME_DATA: u8 = 0x02;
 const FRAME_CLOSE: u8 = 0x03;
 const FRAME_KEEPALIVE: u8 = 0x04;
+const FRAME_FIN: u8 = 0x05;
 
 const NONCE_LEN: usize = 24;
 const MAC_LEN: usize = 32;
@@ -40,7 +41,13 @@ struct Frame {
     data: Vec<u8>,
 }
 
-type ConnMap = Arc<Mutex<HashMap<u32, Arc<Mutex<OwnedWriteHalf>>>>>;
+struct ConnState {
+    writer: Mutex<OwnedWriteHalf>,
+    local_fin: AtomicBool,
+    peer_fin: AtomicBool,
+}
+
+type ConnMap = Arc<Mutex<HashMap<u32, Arc<ConnState>>>>;
 
 #[derive(Parser)]
 #[command(name = "mytunnel", version = "0.1.0")]
@@ -335,8 +342,12 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], _max_frame_size: usize)
         let id = next_id.fetch_add(1, Ordering::Relaxed);
         log_debug(&format!("OPEN id={} from {}", id, peer));
         let (read_half, write_half) = socket.into_split();
-        let write_arc = Arc::new(Mutex::new(write_half));
-        connections.lock().await.insert(id, Arc::clone(&write_arc));
+        let state = Arc::new(ConnState {
+            writer: Mutex::new(write_half),
+            local_fin: AtomicBool::new(false),
+            peer_fin: AtomicBool::new(false),
+        });
+        connections.lock().await.insert(id, Arc::clone(&state));
 
         if tx
             .send(Frame {
@@ -355,9 +366,8 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], _max_frame_size: usize)
         let conns = Arc::clone(&connections);
         let tx_clone = tx.clone();
         tokio::spawn(async move {
-            pump_socket_to_tunnel(read_half, id, tx_clone).await;
-            conns.lock().await.remove(&id);
-            log_debug(&format!("CLOSE id={} from {}", id, peer));
+            pump_socket_to_tunnel(read_half, id, tx_clone, conns).await;
+            log_debug(&format!("FIN id={} from {}", id, peer));
         });
     }
 }
@@ -444,7 +454,7 @@ async fn tunnel_reader_server(
             FRAME_DATA => {
                 let conn = { conns.lock().await.get(&frame.id).cloned() };
                 if let Some(conn) = conn {
-                    let mut w = conn.lock().await;
+                    let mut w = conn.writer.lock().await;
                     if let Err(e) = w.write_all(&frame.data).await {
                         eprintln!("Write to public failed: {e}");
                         conns.lock().await.remove(&frame.id);
@@ -455,6 +465,18 @@ async fn tunnel_reader_server(
                                 data: Vec::new(),
                             })
                             .await;
+                    }
+                }
+            }
+            FRAME_FIN => {
+                let conn = { conns.lock().await.get(&frame.id).cloned() };
+                if let Some(conn) = conn {
+                    log_debug(&format!("RX FIN id={}", frame.id));
+                    conn.peer_fin.store(true, Ordering::SeqCst);
+                    let mut w = conn.writer.lock().await;
+                    let _ = w.shutdown().await;
+                    if conn.local_fin.load(Ordering::SeqCst) {
+                        conns.lock().await.remove(&frame.id);
                     }
                 }
             }
@@ -483,15 +505,16 @@ async fn tunnel_reader_client(
                 match TcpStream::connect(&target).await {
                     Ok(socket) => {
                         let (read_half, write_half) = socket.into_split();
-                        conns
-                            .lock()
-                            .await
-                            .insert(id, Arc::new(Mutex::new(write_half)));
+                        let state = Arc::new(ConnState {
+                            writer: Mutex::new(write_half),
+                            local_fin: AtomicBool::new(false),
+                            peer_fin: AtomicBool::new(false),
+                        });
+                        conns.lock().await.insert(id, Arc::clone(&state));
                         let conns_clone = Arc::clone(&conns);
                         let tx_clone = tx.clone();
                         tokio::spawn(async move {
-                            pump_socket_to_tunnel(read_half, id, tx_clone).await;
-                            conns_clone.lock().await.remove(&id);
+                            pump_socket_to_tunnel(read_half, id, tx_clone, conns_clone).await;
                         });
                     }
                     Err(e) => {
@@ -509,7 +532,7 @@ async fn tunnel_reader_client(
             FRAME_DATA => {
                 let conn = { conns.lock().await.get(&frame.id).cloned() };
                 if let Some(conn) = conn {
-                    let mut w = conn.lock().await;
+                    let mut w = conn.writer.lock().await;
                     if let Err(e) = w.write_all(&frame.data).await {
                         eprintln!("Write to target failed: {e}");
                         conns.lock().await.remove(&frame.id);
@@ -521,9 +544,20 @@ async fn tunnel_reader_client(
                             })
                             .await;
                     }
-                }
-                else {
+                } else {
                     eprintln!("DATA for unknown id={}", frame.id);
+                }
+            }
+            FRAME_FIN => {
+                let conn = { conns.lock().await.get(&frame.id).cloned() };
+                if let Some(conn) = conn {
+                    log_debug(&format!("RX FIN id={}", frame.id));
+                    conn.peer_fin.store(true, Ordering::SeqCst);
+                    let mut w = conn.writer.lock().await;
+                    let _ = w.shutdown().await;
+                    if conn.local_fin.load(Ordering::SeqCst) {
+                        conns.lock().await.remove(&frame.id);
+                    }
                 }
             }
             FRAME_CLOSE => {
@@ -540,12 +574,30 @@ async fn pump_socket_to_tunnel(
     mut reader: OwnedReadHalf,
     id: u32,
     tx: mpsc::Sender<Frame>,
+    conns: ConnMap,
 ) {
     let mut buf = vec![0u8; 16 * 1024];
     let mut first = true;
     loop {
         match reader.read(&mut buf).await {
-            Ok(0) => break,
+            Ok(0) => {
+                log_debug(&format!("TX FIN id={}", id));
+                let _ = tx
+                    .send(Frame {
+                        kind: FRAME_FIN,
+                        id,
+                        data: Vec::new(),
+                    })
+                    .await;
+                let conn = { conns.lock().await.get(&id).cloned() };
+                if let Some(conn) = conn {
+                    conn.local_fin.store(true, Ordering::SeqCst);
+                    if conn.peer_fin.load(Ordering::SeqCst) {
+                        conns.lock().await.remove(&id);
+                    }
+                }
+                return;
+            }
             Ok(n) => {
                 if first {
                     log_debug(&format!("TX DATA id={} bytes={}", id, n));
@@ -560,19 +612,30 @@ async fn pump_socket_to_tunnel(
                     .await
                     .is_err()
                 {
-                    break;
+                    let _ = tx
+                        .send(Frame {
+                            kind: FRAME_CLOSE,
+                            id,
+                            data: Vec::new(),
+                        })
+                        .await;
+                    conns.lock().await.remove(&id);
+                    return;
                 }
             }
-            Err(_) => break,
+            Err(_) => {
+                let _ = tx
+                    .send(Frame {
+                        kind: FRAME_CLOSE,
+                        id,
+                        data: Vec::new(),
+                    })
+                    .await;
+                conns.lock().await.remove(&id);
+                return;
+            }
         }
     }
-    let _ = tx
-        .send(Frame {
-            kind: FRAME_CLOSE,
-            id,
-            data: Vec::new(),
-        })
-        .await;
 }
 
 async fn write_frame(writer: &mut OwnedWriteHalf, frame: &Frame) -> Result<()> {
