@@ -870,7 +870,6 @@ fn apply_socket_opts(stream: &TcpStream) {
     let _ = sock.set_keepalive(true);
     let keepalive = TcpKeepalive::new()
         .with_time(Duration::from_secs(30))
-        .with_interval(Duration::from_secs(10))
-        .with_retries(5);
+        .with_interval(Duration::from_secs(10));
     let _ = sock.set_tcp_keepalive(&keepalive);
 }
