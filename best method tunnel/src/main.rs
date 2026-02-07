@@ -15,10 +15,11 @@ use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use socket2::{SockRef, TcpKeepalive};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    net::tcp::{OwnedReadHalf, OwnedWriteHalf, TcpKeepalive},
+    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
     sync::{mpsc, Mutex},
 };
 use tokio::sync::mpsc::error::TrySendError;
@@ -865,9 +866,11 @@ fn log_debug(msg: &str) {
 
 fn apply_socket_opts(stream: &TcpStream) {
     let _ = stream.set_nodelay(true);
+    let sock = SockRef::from(stream);
+    let _ = sock.set_keepalive(true);
     let keepalive = TcpKeepalive::new()
         .with_time(Duration::from_secs(30))
         .with_interval(Duration::from_secs(10))
         .with_retries(5);
-    let _ = stream.set_keepalive(Some(keepalive));
+    let _ = sock.set_tcp_keepalive(&keepalive);
 }
