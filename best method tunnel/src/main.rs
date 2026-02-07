@@ -396,12 +396,14 @@ async fn run_client(
 
 async fn server_handshake(stream: &mut TcpStream, psk: &[u8; 32]) -> Result<()> {
     let mut msg_type = [0u8; 1];
+    log_debug("Handshake: waiting for client hello");
     stream.read_exact(&mut msg_type).await?;
     if msg_type[0] != HANDSHAKE_CLIENT_HELLO {
         bail!("Unexpected handshake");
     }
     let mut client_nonce = [0u8; NONCE_LEN];
     stream.read_exact(&mut client_nonce).await?;
+    log_debug("Handshake: got client hello");
 
     let mut server_nonce = [0u8; NONCE_LEN];
     rand::rngs::OsRng.fill_bytes(&mut server_nonce);
@@ -415,6 +417,7 @@ async fn server_handshake(stream: &mut TcpStream, psk: &[u8; 32]) -> Result<()> 
     stream.write_all(&[HANDSHAKE_SERVER_HELLO]).await?;
     stream.write_all(&server_nonce).await?;
     stream.write_all(&server_mac).await?;
+    log_debug("Handshake: sent server hello");
 
     stream.read_exact(&mut msg_type).await?;
     if msg_type[0] != HANDSHAKE_CLIENT_ACK {
@@ -422,6 +425,7 @@ async fn server_handshake(stream: &mut TcpStream, psk: &[u8; 32]) -> Result<()> 
     }
     let mut client_mac = [0u8; MAC_LEN];
     stream.read_exact(&mut client_mac).await?;
+    log_debug("Handshake: got client ack");
 
     let mut data = Vec::with_capacity(6 + NONCE_LEN * 2);
     data.extend_from_slice(b"client");
@@ -433,6 +437,7 @@ async fn server_handshake(stream: &mut TcpStream, psk: &[u8; 32]) -> Result<()> 
     }
 
     stream.write_all(&[HANDSHAKE_SERVER_OK]).await?;
+    log_debug("Handshake: sent server ok");
     Ok(())
 }
 
@@ -442,6 +447,7 @@ async fn client_handshake(stream: &mut TcpStream, psk: &[u8; 32]) -> Result<()> 
 
     stream.write_all(&[HANDSHAKE_CLIENT_HELLO]).await?;
     stream.write_all(&client_nonce).await?;
+    log_debug("Handshake: sent client hello");
 
     let mut msg_type = [0u8; 1];
     stream.read_exact(&mut msg_type).await?;
@@ -452,6 +458,7 @@ async fn client_handshake(stream: &mut TcpStream, psk: &[u8; 32]) -> Result<()> 
     stream.read_exact(&mut server_nonce).await?;
     let mut server_mac = [0u8; MAC_LEN];
     stream.read_exact(&mut server_mac).await?;
+    log_debug("Handshake: got server hello");
 
     let mut data = Vec::with_capacity(6 + NONCE_LEN * 2);
     data.extend_from_slice(b"server");
@@ -470,11 +477,13 @@ async fn client_handshake(stream: &mut TcpStream, psk: &[u8; 32]) -> Result<()> 
 
     stream.write_all(&[HANDSHAKE_CLIENT_ACK]).await?;
     stream.write_all(&client_mac).await?;
+    log_debug("Handshake: sent client ack");
 
     stream.read_exact(&mut msg_type).await?;
     if msg_type[0] != HANDSHAKE_SERVER_OK {
         bail!("Handshake failed");
     }
+    log_debug("Handshake: got server ok");
     Ok(())
 }
 
