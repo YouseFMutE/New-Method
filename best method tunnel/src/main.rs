@@ -286,6 +286,7 @@ async fn run_server(server: ServerConfig, psk: [u8; 32]) -> Result<()> {
                 }
 
                 *control.lock().await = None;
+                log_info("Tunnel disconnected");
             }
         });
     }
@@ -293,11 +294,16 @@ async fn run_server(server: ServerConfig, psk: [u8; 32]) -> Result<()> {
     log_info(&format!("Public listen on {}", public_listen));
     loop {
         let (mut socket, _) = public_listener.accept().await?;
+        let peer = socket
+            .peer_addr()
+            .map(|p| p.to_string())
+            .unwrap_or_else(|_| "unknown".into());
+        log_debug(&format!("Public connection from {}", peer));
         let control_opt = control.lock().await.clone();
         let control = match control_opt {
             Some(c) => c,
             None => {
-                eprintln!("No tunnel connected; dropping incoming connection.");
+                eprintln!("No tunnel connected; dropping incoming connection from {peer}.");
                 continue;
             }
         };
@@ -309,8 +315,15 @@ async fn run_server(server: ServerConfig, psk: [u8; 32]) -> Result<()> {
             };
             match stream_res {
                 Ok(stream) => {
+                    log_debug(&format!("Opened tunnel stream for {}", peer));
                     let mut stream = stream;
-                    let _ = copy_bidirectional(&mut socket, &mut stream).await;
+                    match copy_bidirectional(&mut socket, &mut stream).await {
+                        Ok((a, b)) => log_debug(&format!(
+                            "Public {} closed (up {} bytes, down {} bytes)",
+                            peer, a, b
+                        )),
+                        Err(e) => eprintln!("Copy failed for {peer}: {e}"),
+                    }
                 }
                 Err(e) => {
                     eprintln!("Open stream failed: {e}");
@@ -342,12 +355,20 @@ async fn run_client(
                 while let Some(res) = yamux.next().await {
                     match res {
                         Ok(stream) => {
+                            log_debug("Inbound stream from server");
                             let target = client.target.clone();
                             tokio::spawn(async move {
                                 match TcpStream::connect(&target).await {
                                     Ok(mut target_sock) => {
+                                        log_debug(&format!("Connected to target {}", target));
                                         let mut stream = stream;
-                                        let _ = copy_bidirectional(&mut stream, &mut target_sock).await;
+                                        match copy_bidirectional(&mut stream, &mut target_sock).await {
+                                            Ok((a, b)) => log_debug(&format!(
+                                                "Target {} closed (up {} bytes, down {} bytes)",
+                                                target, a, b
+                                            )),
+                                            Err(e) => eprintln!("Copy failed for target {target}: {e}"),
+                                        }
                                     }
                                     Err(e) => {
                                         eprintln!("Target connect failed: {e}");
@@ -497,4 +518,10 @@ fn log_info(msg: &str) {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     println!("[{ts}] {msg}");
+}
+
+fn log_debug(msg: &str) {
+    if std::env::var("MYTUNNEL_DEBUG").is_ok() {
+        log_info(msg);
+    }
 }
