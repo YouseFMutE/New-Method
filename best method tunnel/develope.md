@@ -19,7 +19,7 @@
 - امنیت ارتباط: PSK (بدون TLS، بدون رمزنگاری دیتا)
   - کلید مشترک (PSK) بین Server/Client
   - احراز هویت: PSK + HMAC (یک‌طرفه)
-- پروتکل انتقال: tcpmux (yamux)
+- پروتکل انتقال: multiplex داخلی (frame-based)
   - چند stream روی یک اتصال TCP
   - سربار کم و مناسب برای کانکشن پایدار
 
@@ -67,7 +67,7 @@ mytunnel run
 
 ## Milestones
 1. طراحی پروتکل فریم‌بندی و message types
-2. پیاده‌سازی roleها با TCP + PSK + tcpmux (yamux)
+2. پیاده‌سازی roleها با TCP + PSK + multiplex داخلی
 3. CLI + TUI اولیه
 4. مدیریت کانکشن‌ها و backpressure
 5. تست‌های یکپارچگی و Load test ساده
@@ -84,5 +84,5 @@ mytunnel run
 - Session Key:
   - HKDF(psk, salt=client_nonce||server_nonce, info="tunnel-v1-keys")
 - Data:
-  - انتقال داده از طریق stream های yamux
+  - انتقال داده از طریق فریم‌های داخلی multiplex
   - داده‌ها **رمزنگاری نمی‌شوند**

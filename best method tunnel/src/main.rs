@@ -1,33 +1,46 @@
 use std::{
+    collections::HashMap,
     path::PathBuf,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Parser, Subcommand};
 use dialoguer::{Input, Password, Select};
-use futures_util::StreamExt;
 use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::{
-    io::{copy_bidirectional, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
-    sync::Mutex,
+    net::tcp::{OwnedReadHalf, OwnedWriteHalf},
+    sync::{mpsc, Mutex},
 };
-use tokio_yamux::{Config as YamuxConfig, Control, Session};
-use tokio_yamux::session::SessionType;
 
 type HmacSha256 = Hmac<Sha256>;
 
 const HANDSHAKE_CLIENT_HELLO: u8 = 0x01;
-const STREAM_KIND_KEEPALIVE: u8 = 0x00;
-const STREAM_KIND_DATA: u8 = 0x01;
+const FRAME_OPEN: u8 = 0x01;
+const FRAME_DATA: u8 = 0x02;
+const FRAME_CLOSE: u8 = 0x03;
+const FRAME_KEEPALIVE: u8 = 0x04;
 
 const NONCE_LEN: usize = 24;
 const MAC_LEN: usize = 32;
+
+#[derive(Debug)]
+struct Frame {
+    kind: u8,
+    id: u32,
+    data: Vec<u8>,
+}
+
+type ConnMap = Arc<Mutex<HashMap<u32, Arc<Mutex<OwnedWriteHalf>>>>>;
 
 #[derive(Parser)]
 #[command(name = "mytunnel", version = "0.1.0")]
@@ -236,7 +249,7 @@ fn load_config(path: &PathBuf) -> Result<Config> {
     Ok(config)
 }
 
-async fn run_server(server: ServerConfig, psk: [u8; 32], max_frame_size: usize) -> Result<()> {
+async fn run_server(server: ServerConfig, psk: [u8; 32], _max_frame_size: usize) -> Result<()> {
     let tunnel_listen = server.tunnel_listen.clone();
     let public_listen = server.public_listen.clone();
 
@@ -247,11 +260,14 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], max_frame_size: usize) 
         .await
         .with_context(|| format!("Bind public listener {}", public_listen))?;
 
-    let control: Arc<Mutex<Option<Arc<Mutex<Control>>>>> = Arc::new(Mutex::new(None));
+    let connections: ConnMap = Arc::new(Mutex::new(HashMap::new()));
+    let tunnel_sender: Arc<Mutex<Option<mpsc::Sender<Frame>>>> = Arc::new(Mutex::new(None));
+    let next_id = Arc::new(AtomicU32::new(1));
 
     // Accept tunnel connection in background.
     {
-        let control = Arc::clone(&control);
+        let tunnel_sender = Arc::clone(&tunnel_sender);
+        let connections = Arc::clone(&connections);
         tokio::spawn(async move {
             loop {
                 log_info(&format!(
@@ -275,31 +291,24 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], max_frame_size: usize) 
                 }
                 log_info(&format!("Tunnel connected from {}", peer));
 
-                let mut yamux = Session::new(
-                    tunnel_stream,
-                    yamux_config(max_frame_size),
-                    SessionType::Server,
-                );
-                *control.lock().await = Some(Arc::new(Mutex::new(yamux.control())));
+                let (read_half, write_half) = tunnel_stream.into_split();
+                let (tx, rx) = mpsc::channel::<Frame>(2048);
+                *tunnel_sender.lock().await = Some(tx.clone());
 
-                let keepalive_control = Arc::new(Mutex::new(yamux.control()));
-                let keepalive_task = tokio::spawn(keepalive_loop(Arc::clone(&keepalive_control)));
-                while let Some(res) = yamux.next().await {
-                    match res {
-                        Ok(mut stream) => {
-                            tokio::spawn(async move {
-                                let _ = handle_inbound_keepalive(stream).await;
-                            });
-                        }
-                        Err(e) => {
-                            eprintln!("Yamux error: {e}");
-                            break;
-                        }
-                    }
-                }
+                let writer_task = tokio::spawn(tunnel_writer(write_half, rx));
+                let reader_task = tokio::spawn(tunnel_reader_server(
+                    read_half,
+                    Arc::clone(&connections),
+                    tx.clone(),
+                ));
+                let keepalive_task = tokio::spawn(keepalive_loop(tx.clone()));
 
-                *control.lock().await = None;
+                let _ = reader_task.await;
+                writer_task.abort();
                 keepalive_task.abort();
+
+                *tunnel_sender.lock().await = None;
+                connections.lock().await.clear();
                 log_info("Tunnel disconnected");
             }
         });
@@ -307,45 +316,45 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], max_frame_size: usize) 
 
     log_info(&format!("Public listen on {}", public_listen));
     loop {
-        let (mut socket, _) = public_listener.accept().await?;
+        let (socket, _) = public_listener.accept().await?;
         let peer = socket
             .peer_addr()
             .map(|p| p.to_string())
             .unwrap_or_else(|_| "unknown".into());
         log_debug(&format!("Public connection from {}", peer));
-        let control_opt = control.lock().await.clone();
-        let control = match control_opt {
-            Some(c) => c,
+
+        let tx_opt = tunnel_sender.lock().await.clone();
+        let tx = match tx_opt {
+            Some(t) => t,
             None => {
                 eprintln!("No tunnel connected; dropping incoming connection from {peer}.");
                 continue;
             }
         };
 
+        let id = next_id.fetch_add(1, Ordering::Relaxed);
+        let (read_half, write_half) = socket.into_split();
+        let write_arc = Arc::new(Mutex::new(write_half));
+        connections.lock().await.insert(id, Arc::clone(&write_arc));
+
+        if tx
+            .send(Frame {
+                kind: FRAME_OPEN,
+                id,
+                data: Vec::new(),
+            })
+            .await
+            .is_err()
+        {
+            connections.lock().await.remove(&id);
+            continue;
+        }
+
+        let conns = Arc::clone(&connections);
+        let tx_clone = tx.clone();
         tokio::spawn(async move {
-            let stream_res = {
-                let mut ctrl = control.lock().await;
-                ctrl.open_stream().await
-            };
-            match stream_res {
-                Ok(mut stream) => {
-                    log_debug(&format!("Opened tunnel stream for {}", peer));
-                    if let Err(e) = stream.write_all(&[STREAM_KIND_DATA]).await {
-                        eprintln!("Failed to write stream header for {peer}: {e}");
-                        return;
-                    }
-                    match copy_bidirectional(&mut socket, &mut stream).await {
-                        Ok((a, b)) => log_debug(&format!(
-                            "Public {} closed (up {} bytes, down {} bytes)",
-                            peer, a, b
-                        )),
-                        Err(e) => eprintln!("Copy failed for {peer}: {e}"),
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Open stream failed: {e}");
-                }
-            }
+            pump_socket_to_tunnel(read_half, id, tx_clone).await;
+            conns.lock().await.remove(&id);
         });
     }
 }
@@ -353,11 +362,12 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], max_frame_size: usize) 
 async fn run_client(
     client: ClientConfig,
     psk: [u8; 32],
-    max_frame_size: usize,
+    _max_frame_size: usize,
     reconnect_delay_ms: u64,
     reconnect_max_delay_ms: u64,
 ) -> Result<()> {
     let mut delay = reconnect_delay_ms;
+    let connections: ConnMap = Arc::new(Mutex::new(HashMap::new()));
     loop {
         log_info(&format!("Connecting to server tunnel {}", client.server_tunnel));
         match TcpStream::connect(&client.server_tunnel).await {
@@ -368,57 +378,21 @@ async fn run_client(
                     continue;
                 }
                 log_info("Tunnel connected to server");
+                let (read_half, write_half) = tunnel_stream.into_split();
+                let (tx, rx) = mpsc::channel::<Frame>(2048);
+                let writer_task = tokio::spawn(tunnel_writer(write_half, rx));
+                let reader_task = tokio::spawn(tunnel_reader_client(
+                    read_half,
+                    Arc::clone(&connections),
+                    tx.clone(),
+                    client.target.clone(),
+                ));
+                let keepalive_task = tokio::spawn(keepalive_loop(tx.clone()));
 
-                let mut yamux = Session::new(
-                    tunnel_stream,
-                    yamux_config(max_frame_size),
-                    SessionType::Client,
-                );
-                let keepalive_control = Arc::new(Mutex::new(yamux.control()));
-                let keepalive_task = tokio::spawn(keepalive_loop(Arc::clone(&keepalive_control)));
-                while let Some(res) = yamux.next().await {
-                    match res {
-                        Ok(mut stream) => {
-                            let mut kind = [0u8; 1];
-                            if let Err(e) = stream.read_exact(&mut kind).await {
-                                eprintln!("Stream header read failed: {e}");
-                                continue;
-                            }
-                            if kind[0] == STREAM_KIND_KEEPALIVE {
-                                log_debug("Keepalive stream received");
-                                tokio::spawn(async move {
-                                    let _ = drain_stream(stream).await;
-                                });
-                                continue;
-                            }
-                            log_debug("Inbound data stream from server");
-                            let target = client.target.clone();
-                            tokio::spawn(async move {
-                                match TcpStream::connect(&target).await {
-                                    Ok(mut target_sock) => {
-                                        log_debug(&format!("Connected to target {}", target));
-                                        let mut stream = stream;
-                                        match copy_bidirectional(&mut stream, &mut target_sock).await {
-                                            Ok((a, b)) => log_debug(&format!(
-                                                "Target {} closed (up {} bytes, down {} bytes)",
-                                                target, a, b
-                                            )),
-                                            Err(e) => eprintln!("Copy failed for target {target}: {e}"),
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Target connect failed: {e}");
-                                    }
-                                }
-                            });
-                        }
-                        Err(e) => {
-                            eprintln!("Yamux error: {e}");
-                            break;
-                        }
-                    }
-                }
+                let _ = reader_task.await;
+                writer_task.abort();
                 keepalive_task.abort();
+                connections.lock().await.clear();
             }
             Err(e) => {
                 eprintln!("Connect failed: {e}");
@@ -429,6 +403,187 @@ async fn run_client(
         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
         delay = std::cmp::min(delay * 2, reconnect_max_delay_ms);
     }
+}
+
+async fn tunnel_writer(mut writer: OwnedWriteHalf, mut rx: mpsc::Receiver<Frame>) {
+    while let Some(frame) = rx.recv().await {
+        if write_frame(&mut writer, &frame).await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn keepalive_loop(tx: mpsc::Sender<Frame>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(15)).await;
+        if tx
+            .send(Frame {
+                kind: FRAME_KEEPALIVE,
+                id: 0,
+                data: Vec::new(),
+            })
+            .await
+            .is_err()
+        {
+            break;
+        }
+    }
+}
+
+async fn tunnel_reader_server(
+    mut reader: OwnedReadHalf,
+    conns: ConnMap,
+    tx: mpsc::Sender<Frame>,
+) -> Result<()> {
+    loop {
+        let frame = read_frame(&mut reader).await?;
+        match frame.kind {
+            FRAME_DATA => {
+                let conn = { conns.lock().await.get(&frame.id).cloned() };
+                if let Some(conn) = conn {
+                    let mut w = conn.lock().await;
+                    if let Err(e) = w.write_all(&frame.data).await {
+                        eprintln!("Write to public failed: {e}");
+                        conns.lock().await.remove(&frame.id);
+                        let _ = tx
+                            .send(Frame {
+                                kind: FRAME_CLOSE,
+                                id: frame.id,
+                                data: Vec::new(),
+                            })
+                            .await;
+                    }
+                }
+            }
+            FRAME_CLOSE => {
+                conns.lock().await.remove(&frame.id);
+            }
+            FRAME_KEEPALIVE => {}
+            FRAME_OPEN => {}
+            _ => {}
+        }
+    }
+}
+
+async fn tunnel_reader_client(
+    mut reader: OwnedReadHalf,
+    conns: ConnMap,
+    tx: mpsc::Sender<Frame>,
+    target: String,
+) -> Result<()> {
+    loop {
+        let frame = read_frame(&mut reader).await?;
+        match frame.kind {
+            FRAME_OPEN => {
+                let id = frame.id;
+                match TcpStream::connect(&target).await {
+                    Ok(socket) => {
+                        let (read_half, write_half) = socket.into_split();
+                        conns
+                            .lock()
+                            .await
+                            .insert(id, Arc::new(Mutex::new(write_half)));
+                        let conns_clone = Arc::clone(&conns);
+                        let tx_clone = tx.clone();
+                        tokio::spawn(async move {
+                            pump_socket_to_tunnel(read_half, id, tx_clone).await;
+                            conns_clone.lock().await.remove(&id);
+                        });
+                    }
+                    Err(e) => {
+                        eprintln!("Target connect failed: {e}");
+                        let _ = tx
+                            .send(Frame {
+                                kind: FRAME_CLOSE,
+                                id,
+                                data: Vec::new(),
+                            })
+                            .await;
+                    }
+                }
+            }
+            FRAME_DATA => {
+                let conn = { conns.lock().await.get(&frame.id).cloned() };
+                if let Some(conn) = conn {
+                    let mut w = conn.lock().await;
+                    if let Err(e) = w.write_all(&frame.data).await {
+                        eprintln!("Write to target failed: {e}");
+                        conns.lock().await.remove(&frame.id);
+                        let _ = tx
+                            .send(Frame {
+                                kind: FRAME_CLOSE,
+                                id: frame.id,
+                                data: Vec::new(),
+                            })
+                            .await;
+                    }
+                }
+            }
+            FRAME_CLOSE => {
+                conns.lock().await.remove(&frame.id);
+            }
+            FRAME_KEEPALIVE => {}
+            _ => {}
+        }
+    }
+}
+
+async fn pump_socket_to_tunnel(
+    mut reader: OwnedReadHalf,
+    id: u32,
+    tx: mpsc::Sender<Frame>,
+) {
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                if tx
+                    .send(Frame {
+                        kind: FRAME_DATA,
+                        id,
+                        data: buf[..n].to_vec(),
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = tx
+        .send(Frame {
+            kind: FRAME_CLOSE,
+            id,
+            data: Vec::new(),
+        })
+        .await;
+}
+
+async fn write_frame(writer: &mut OwnedWriteHalf, frame: &Frame) -> Result<()> {
+    writer.write_all(&[frame.kind]).await?;
+    writer.write_all(&frame.id.to_be_bytes()).await?;
+    let len = frame.data.len() as u32;
+    writer.write_all(&len.to_be_bytes()).await?;
+    if len > 0 {
+        writer.write_all(&frame.data).await?;
+    }
+    Ok(())
+}
+
+async fn read_frame(reader: &mut OwnedReadHalf) -> Result<Frame> {
+    let mut header = [0u8; 9];
+    reader.read_exact(&mut header).await?;
+    let kind = header[0];
+    let id = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+    let len = u32::from_be_bytes([header[5], header[6], header[7], header[8]]) as usize;
+    let mut data = vec![0u8; len];
+    if len > 0 {
+        reader.read_exact(&mut data).await?;
+    }
+    Ok(Frame { kind, id, data })
 }
 
 async fn server_handshake(stream: &mut TcpStream, psk: &[u8; 32]) -> Result<()> {
@@ -504,62 +659,6 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn yamux_config(_max_frame_size: usize) -> YamuxConfig {
-    let mut cfg = YamuxConfig::default();
-    cfg.enable_keepalive = true;
-    cfg.keepalive_interval = Duration::from_secs(15);
-    cfg.connection_write_timeout = Duration::from_secs(600);
-    cfg.max_stream_window_size = 256 * 1024;
-    cfg
-}
-
-async fn keepalive_loop(control: Arc<Mutex<Control>>) {
-    loop {
-        tokio::time::sleep(Duration::from_secs(20)).await;
-        let stream_res = {
-            let mut ctrl = control.lock().await;
-            ctrl.open_stream().await
-        };
-        match stream_res {
-            Ok(mut stream) => {
-                let _ = stream.write_all(&[STREAM_KIND_KEEPALIVE]).await;
-                let _ = stream.shutdown().await;
-            }
-            Err(_) => break,
-        }
-    }
-}
-
-async fn handle_inbound_keepalive<S>(mut stream: S) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let mut kind = [0u8; 1];
-    if stream.read_exact(&mut kind).await.is_err() {
-        return Ok(());
-    }
-    if kind[0] == STREAM_KIND_KEEPALIVE {
-        drain_stream(stream).await?;
-    } else {
-        drain_stream(stream).await?;
-    }
-    Ok(())
-}
-
-async fn drain_stream<S>(mut stream: S) -> Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
-    let mut buf = [0u8; 256];
-    loop {
-        match stream.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(_) => continue,
-            Err(_) => break,
-        }
-    }
-    Ok(())
-}
 
 fn log_info(msg: &str) {
     let ts = std::time::SystemTime::now()
