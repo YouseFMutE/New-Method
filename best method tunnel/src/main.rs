@@ -100,6 +100,26 @@ fn run_init(config_path: PathBuf) -> Result<()> {
     let role = if role == 0 { Role::Server } else { Role::Client };
 
     let psk_hex = loop {
+        let choice = Select::new()
+            .with_prompt("PSK method")
+            .items(&["Generate random PSK", "Enter PSK manually"])
+            .default(0)
+            .interact()?;
+        if choice == 0 {
+            let mut bytes = [0u8; 32];
+            rand::rngs::OsRng.fill_bytes(&mut bytes);
+            let generated = hex::encode(bytes);
+            println!("Generated PSK (64 hex chars): {}", generated);
+            let ok: bool = dialoguer::Confirm::new()
+                .with_prompt("Use this PSK?")
+                .default(true)
+                .interact()?;
+            if ok {
+                break generated;
+            }
+            continue;
+        }
+
         let psk = Password::new()
             .with_prompt("Enter PSK (hex, 64 chars)")
             .with_confirmation("Confirm PSK", "Mismatch")

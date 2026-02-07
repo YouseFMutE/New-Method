@@ -38,6 +38,8 @@
 - پورت تونل روی Server (مثلا 9000)
 - مقصد نهایی روی Client (مثلا 127.0.0.1:1414)
 - کلید مشترک امنیتی (PSK)
+  - امکان تولید PSK رندوم
+  - امکان ورود دستی PSK
 - زمان تلاش مجدد اتصال (reconnect)
   - reconnect_delay_ms و reconnect_max_delay_ms
 
