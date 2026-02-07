@@ -329,7 +329,17 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], _max_frame_size: usize)
                     tokio::spawn(tunnel_reader_server(read_half, Arc::clone(&session.conns), tx));
                 let keepalive_task = tokio::spawn(keepalive_loop(session.tx.clone()));
 
-                let _ = reader_task.await;
+                match reader_task.await {
+                    Ok(Ok(())) => {
+                        log_debug("Tunnel reader finished");
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("Tunnel reader error: {e}");
+                    }
+                    Err(e) => {
+                        eprintln!("Tunnel reader join error: {e}");
+                    }
+                }
                 writer_task.abort();
                 keepalive_task.abort();
 
@@ -461,7 +471,20 @@ async fn run_client_session(
                 ));
                 let keepalive_task = tokio::spawn(keepalive_loop(tx.clone()));
 
-                let _ = reader_task.await;
+                match reader_task.await {
+                    Ok(Ok(())) => {
+                        log_debug(&format!(
+                            "Tunnel reader finished (session {})",
+                            session_id
+                        ));
+                    }
+                    Ok(Err(e)) => {
+                        eprintln!("Tunnel reader error (session {}): {e}", session_id);
+                    }
+                    Err(e) => {
+                        eprintln!("Tunnel reader join error (session {}): {e}", session_id);
+                    }
+                }
                 writer_task.abort();
                 keepalive_task.abort();
                 connections.lock().await.clear();
