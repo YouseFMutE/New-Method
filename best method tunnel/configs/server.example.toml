@@ -1,4 +1,5 @@
 role = "server"
+transport = "app_tcp"
 psk_hex = "REPLACE_WITH_64_HEX_CHARS"
 max_frame_size = 1048576
 reconnect_delay_ms = 1000

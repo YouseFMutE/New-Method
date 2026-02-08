@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use socket2::{SockRef, TcpKeepalive};
 use tokio::{
+    io::AsyncRead,
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     net::tcp::{OwnedReadHalf, OwnedWriteHalf},
@@ -47,6 +48,7 @@ struct ConnState {
     writer: Mutex<OwnedWriteHalf>,
     local_fin: AtomicBool,
     peer_fin: AtomicBool,
+    last_activity: AtomicU64,
 }
 
 type ConnMap = Arc<Mutex<HashMap<u32, Arc<ConnState>>>>;
@@ -86,9 +88,19 @@ enum Role {
     Client,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default)]
+#[serde(rename_all = "snake_case")]
+enum TransportMode {
+    #[default]
+    Raw,
+    AppTcp,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 struct Config {
     role: Role,
+    #[serde(default)]
+    transport: TransportMode,
     psk_hex: String,
     max_frame_size: usize,
     reconnect_delay_ms: u64,
@@ -131,6 +143,16 @@ fn run_init(config_path: PathBuf) -> Result<()> {
         .default(0)
         .interact()?;
     let role = if role == 0 { Role::Server } else { Role::Client };
+    let transport = Select::new()
+        .with_prompt("Transport mode")
+        .items(&["app_tcp (HTTP-like framing)", "raw (legacy binary)"])
+        .default(0)
+        .interact()?;
+    let transport = if transport == 0 {
+        TransportMode::AppTcp
+    } else {
+        TransportMode::Raw
+    };
 
     let psk_hex = loop {
         let choice = Select::new()
@@ -220,6 +242,7 @@ fn run_init(config_path: PathBuf) -> Result<()> {
 
     let config = Config {
         role,
+        transport,
         psk_hex,
         max_frame_size,
         reconnect_delay_ms,
@@ -237,6 +260,7 @@ fn run_init(config_path: PathBuf) -> Result<()> {
 async fn run(config_path: PathBuf) -> Result<()> {
     let config = load_config(&config_path)?;
     let psk = parse_psk(&config.psk_hex)?;
+    let transport = config.transport;
 
     match config.role {
         Role::Server => {
@@ -244,7 +268,7 @@ async fn run(config_path: PathBuf) -> Result<()> {
                 .server
                 .clone()
                 .ok_or_else(|| anyhow!("Missing server config"))?;
-            run_server(server, psk, config.max_frame_size).await
+            run_server(server, psk, config.max_frame_size, transport).await
         }
         Role::Client => {
             let client = config
@@ -257,6 +281,7 @@ async fn run(config_path: PathBuf) -> Result<()> {
                 config.max_frame_size,
                 config.reconnect_delay_ms,
                 config.reconnect_max_delay_ms,
+                transport,
             )
             .await
         }
@@ -273,7 +298,12 @@ fn load_config(path: &PathBuf) -> Result<Config> {
     Ok(config)
 }
 
-async fn run_server(server: ServerConfig, psk: [u8; 32], _max_frame_size: usize) -> Result<()> {
+async fn run_server(
+    server: ServerConfig,
+    psk: [u8; 32],
+    _max_frame_size: usize,
+    transport: TransportMode,
+) -> Result<()> {
     let tunnel_listen = server.tunnel_listen.clone();
     let public_listen = server.public_listen.clone();
 
@@ -310,7 +340,7 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], _max_frame_size: usize)
                     .peer_addr()
                     .map(|p| p.to_string())
                     .unwrap_or_else(|_| "unknown".into());
-                if let Err(e) = server_handshake(&mut tunnel_stream, &psk).await {
+                if let Err(e) = server_handshake(&mut tunnel_stream, &psk, transport).await {
                     eprintln!("Handshake failed: {e}");
                     continue;
                 }
@@ -326,13 +356,15 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], _max_frame_size: usize)
                 });
                 sessions.lock().await.push(Arc::clone(&session));
 
-                let mut writer_task = tokio::spawn(tunnel_writer(write_half, rx));
+                let mut writer_task = tokio::spawn(tunnel_writer(write_half, rx, transport));
                 let mut reader_task = tokio::spawn(tunnel_reader_server(
                     read_half,
                     Arc::clone(&session.conns),
                     tx,
+                    transport,
                 ));
                 let keepalive_task = tokio::spawn(keepalive_loop(session.tx.clone()));
+                let reaper_task = tokio::spawn(reap_half_closed(Arc::clone(&session.conns)));
 
                 tokio::select! {
                     res = &mut reader_task => {
@@ -352,6 +384,7 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], _max_frame_size: usize)
                 }
 
                 keepalive_task.abort();
+                reaper_task.abort();
                 reader_task.abort();
                 writer_task.abort();
 
@@ -399,6 +432,7 @@ async fn run_server(server: ServerConfig, psk: [u8; 32], _max_frame_size: usize)
             writer: Mutex::new(write_half),
             local_fin: AtomicBool::new(false),
             peer_fin: AtomicBool::new(false),
+            last_activity: AtomicU64::new(now_secs()),
         });
         session.conns.lock().await.insert(id, Arc::clone(&state));
 
@@ -432,6 +466,7 @@ async fn run_client(
     _max_frame_size: usize,
     reconnect_delay_ms: u64,
     reconnect_max_delay_ms: u64,
+    transport: TransportMode,
 ) -> Result<()> {
     let mux_con = client.mux_con.unwrap_or(1).max(1);
     for idx in 0..mux_con {
@@ -442,6 +477,7 @@ async fn run_client(
             psk,
             reconnect_delay_ms,
             reconnect_max_delay_ms,
+            transport,
         ));
     }
     loop {
@@ -455,6 +491,7 @@ async fn run_client_session(
     psk: [u8; 32],
     reconnect_delay_ms: u64,
     reconnect_max_delay_ms: u64,
+    transport: TransportMode,
 ) {
     let mut delay = reconnect_delay_ms;
     let connections: ConnMap = Arc::new(Mutex::new(HashMap::new()));
@@ -467,21 +504,23 @@ async fn run_client_session(
             Ok(mut tunnel_stream) => {
                 apply_socket_opts(&tunnel_stream);
                 delay = reconnect_delay_ms;
-                if let Err(e) = client_handshake(&mut tunnel_stream, &psk).await {
+                if let Err(e) = client_handshake(&mut tunnel_stream, &psk, transport).await {
                     eprintln!("Handshake failed: {e}");
                     continue;
                 }
                 log_info(&format!("Tunnel connected to server (session {})", session_id));
                 let (read_half, write_half) = tunnel_stream.into_split();
                 let (tx, rx) = mpsc::channel::<Frame>(2048);
-                let mut writer_task = tokio::spawn(tunnel_writer(write_half, rx));
+                let mut writer_task = tokio::spawn(tunnel_writer(write_half, rx, transport));
                 let mut reader_task = tokio::spawn(tunnel_reader_client(
                     read_half,
                     Arc::clone(&connections),
                     tx.clone(),
                     client.target.clone(),
+                    transport,
                 ));
                 let keepalive_task = tokio::spawn(keepalive_loop(tx.clone()));
+                let reaper_task = tokio::spawn(reap_half_closed(Arc::clone(&connections)));
 
                 tokio::select! {
                     res = &mut reader_task => {
@@ -501,6 +540,7 @@ async fn run_client_session(
                 }
 
                 keepalive_task.abort();
+                reaper_task.abort();
                 reader_task.abort();
                 writer_task.abort();
                 close_all_conns(&connections).await;
@@ -516,9 +556,13 @@ async fn run_client_session(
     }
 }
 
-async fn tunnel_writer(mut writer: OwnedWriteHalf, mut rx: mpsc::Receiver<Frame>) -> Result<()> {
+async fn tunnel_writer(
+    mut writer: OwnedWriteHalf,
+    mut rx: mpsc::Receiver<Frame>,
+    transport: TransportMode,
+) -> Result<()> {
     while let Some(frame) = rx.recv().await {
-        write_frame(&mut writer, &frame).await?;
+        write_frame(&mut writer, &frame, transport).await?;
     }
     Ok(())
 }
@@ -543,9 +587,10 @@ async fn tunnel_reader_server(
     mut reader: OwnedReadHalf,
     conns: ConnMap,
     tx: mpsc::Sender<Frame>,
+    transport: TransportMode,
 ) -> Result<()> {
     loop {
-        let frame = read_frame(&mut reader).await?;
+        let frame = read_frame(&mut reader, transport).await?;
         match frame.kind {
             FRAME_DATA => {
                 let conn = { conns.lock().await.get(&frame.id).cloned() };
@@ -561,6 +606,8 @@ async fn tunnel_reader_server(
                                 data: Vec::new(),
                             })
                             .await;
+                    } else {
+                        touch_conn(&conn);
                     }
                 }
             }
@@ -569,6 +616,7 @@ async fn tunnel_reader_server(
                 if let Some(conn) = conn {
                     log_debug(&format!("RX FIN id={}", frame.id));
                     conn.peer_fin.store(true, Ordering::SeqCst);
+                    touch_conn(&conn);
                     let mut w = conn.writer.lock().await;
                     let _ = w.shutdown().await;
                     if conn.local_fin.load(Ordering::SeqCst) {
@@ -591,9 +639,10 @@ async fn tunnel_reader_client(
     conns: ConnMap,
     tx: mpsc::Sender<Frame>,
     target: String,
+    transport: TransportMode,
 ) -> Result<()> {
     loop {
-        let frame = read_frame(&mut reader).await?;
+        let frame = read_frame(&mut reader, transport).await?;
         match frame.kind {
             FRAME_OPEN => {
                 let id = frame.id;
@@ -606,6 +655,7 @@ async fn tunnel_reader_client(
                             writer: Mutex::new(write_half),
                             local_fin: AtomicBool::new(false),
                             peer_fin: AtomicBool::new(false),
+                            last_activity: AtomicU64::new(now_secs()),
                         });
                         conns.lock().await.insert(id, Arc::clone(&state));
                         let conns_clone = Arc::clone(&conns);
@@ -640,6 +690,8 @@ async fn tunnel_reader_client(
                                 data: Vec::new(),
                             })
                             .await;
+                    } else {
+                        touch_conn(&conn);
                     }
                 } else {
                     eprintln!("DATA for unknown id={}", frame.id);
@@ -650,6 +702,7 @@ async fn tunnel_reader_client(
                 if let Some(conn) = conn {
                     log_debug(&format!("RX FIN id={}", frame.id));
                     conn.peer_fin.store(true, Ordering::SeqCst);
+                    touch_conn(&conn);
                     let mut w = conn.writer.lock().await;
                     let _ = w.shutdown().await;
                     if conn.local_fin.load(Ordering::SeqCst) {
@@ -689,6 +742,7 @@ async fn pump_socket_to_tunnel(
                 let conn = { conns.lock().await.get(&id).cloned() };
                 if let Some(conn) = conn {
                     conn.local_fin.store(true, Ordering::SeqCst);
+                    touch_conn(&conn);
                     if conn.peer_fin.load(Ordering::SeqCst) {
                         conns.lock().await.remove(&id);
                     }
@@ -718,6 +772,10 @@ async fn pump_socket_to_tunnel(
                         .await;
                     close_conn(&conns, id).await;
                     return;
+                }
+                let conn = { conns.lock().await.get(&id).cloned() };
+                if let Some(conn) = conn {
+                    touch_conn(&conn);
                 }
             }
             Err(_) => {
@@ -752,54 +810,152 @@ async fn close_all_conns(conns: &ConnMap) {
     conns.lock().await.clear();
 }
 
-async fn write_frame(writer: &mut OwnedWriteHalf, frame: &Frame) -> Result<()> {
-    writer.write_all(&[frame.kind]).await?;
-    writer.write_all(&frame.id.to_be_bytes()).await?;
-    let len = frame.data.len() as u32;
-    writer.write_all(&len.to_be_bytes()).await?;
-    if len > 0 {
-        writer.write_all(&frame.data).await?;
+async fn reap_half_closed(conns: ConnMap) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        let now = now_secs();
+        let stale = {
+            let map = conns.lock().await;
+            map.iter()
+                .filter_map(|(id, conn)| {
+                    let age = now.saturating_sub(conn.last_activity.load(Ordering::Relaxed));
+                    let half_closed = conn.local_fin.load(Ordering::Relaxed)
+                        || conn.peer_fin.load(Ordering::Relaxed);
+                    if half_closed && age >= 30 {
+                        Some(*id)
+                    } else {
+                        None
+                    }
+                })
+                .collect::<Vec<_>>()
+        };
+        for id in stale {
+            log_debug(&format!("Reap stale half-closed id={}", id));
+            close_conn(&conns, id).await;
+        }
     }
-    Ok(())
 }
 
-async fn read_frame(reader: &mut OwnedReadHalf) -> Result<Frame> {
-    let mut header = [0u8; 9];
-    reader.read_exact(&mut header).await?;
-    let kind = header[0];
-    let id = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
-    let len = u32::from_be_bytes([header[5], header[6], header[7], header[8]]) as usize;
-    let mut data = vec![0u8; len];
-    if len > 0 {
-        reader.read_exact(&mut data).await?;
+async fn write_frame(writer: &mut OwnedWriteHalf, frame: &Frame, transport: TransportMode) -> Result<()> {
+    match transport {
+        TransportMode::Raw => {
+            writer.write_all(&[frame.kind]).await?;
+            writer.write_all(&frame.id.to_be_bytes()).await?;
+            let len = frame.data.len() as u32;
+            writer.write_all(&len.to_be_bytes()).await?;
+            if len > 0 {
+                writer.write_all(&frame.data).await?;
+            }
+            Ok(())
+        }
+        TransportMode::AppTcp => {
+            let mut payload = Vec::with_capacity(9 + frame.data.len());
+            payload.push(frame.kind);
+            payload.extend_from_slice(&frame.id.to_be_bytes());
+            payload.extend_from_slice(&(frame.data.len() as u32).to_be_bytes());
+            payload.extend_from_slice(&frame.data);
+            write_http_envelope(writer, "/sync", &payload).await
+        }
     }
-    Ok(Frame { kind, id, data })
 }
 
-async fn server_handshake(stream: &mut TcpStream, psk: &[u8; 32]) -> Result<()> {
-    let mut msg_type = [0u8; 1];
-    log_debug("Handshake: waiting for client hello");
-    stream.read_exact(&mut msg_type).await?;
-    if msg_type[0] != HANDSHAKE_CLIENT_HELLO {
-        bail!("Unexpected handshake");
+async fn read_frame(reader: &mut OwnedReadHalf, transport: TransportMode) -> Result<Frame> {
+    match transport {
+        TransportMode::Raw => {
+            let mut header = [0u8; 9];
+            reader.read_exact(&mut header).await?;
+            let kind = header[0];
+            let id = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+            let len = u32::from_be_bytes([header[5], header[6], header[7], header[8]]) as usize;
+            let mut data = vec![0u8; len];
+            if len > 0 {
+                reader.read_exact(&mut data).await?;
+            }
+            Ok(Frame { kind, id, data })
+        }
+        TransportMode::AppTcp => {
+            let payload = read_http_body(reader).await?;
+            if payload.len() < 9 {
+                bail!("Invalid app_tcp frame payload");
+            }
+            let kind = payload[0];
+            let id = u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]);
+            let len = u32::from_be_bytes([payload[5], payload[6], payload[7], payload[8]]) as usize;
+            if payload.len() != len + 9 {
+                bail!("Invalid app_tcp frame length");
+            }
+            Ok(Frame {
+                kind,
+                id,
+                data: payload[9..].to_vec(),
+            })
+        }
     }
-    let mut client_nonce = [0u8; NONCE_LEN];
-    stream.read_exact(&mut client_nonce).await?;
-    let mut client_mac = [0u8; MAC_LEN];
-    stream.read_exact(&mut client_mac).await?;
-    log_debug("Handshake: got client hello");
-
-    let mut data = Vec::with_capacity(6 + NONCE_LEN);
-    data.extend_from_slice(b"client");
-    data.extend_from_slice(&client_nonce);
-    let expected = hmac_tag(psk, &data);
-    if !ct_eq(&expected, &client_mac) {
-        bail!("Handshake auth failed");
-    }
-    Ok(())
 }
 
-async fn client_handshake(stream: &mut TcpStream, psk: &[u8; 32]) -> Result<()> {
+async fn server_handshake(stream: &mut TcpStream, psk: &[u8; 32], transport: TransportMode) -> Result<()> {
+    match transport {
+        TransportMode::Raw => {
+            let mut msg_type = [0u8; 1];
+            log_debug("Handshake: waiting for client hello");
+            stream.read_exact(&mut msg_type).await?;
+            if msg_type[0] != HANDSHAKE_CLIENT_HELLO {
+                bail!("Unexpected handshake");
+            }
+            let mut client_nonce = [0u8; NONCE_LEN];
+            stream.read_exact(&mut client_nonce).await?;
+            let mut client_mac = [0u8; MAC_LEN];
+            stream.read_exact(&mut client_mac).await?;
+            log_debug("Handshake: got client hello");
+
+            let mut data = Vec::with_capacity(6 + NONCE_LEN);
+            data.extend_from_slice(b"client");
+            data.extend_from_slice(&client_nonce);
+            let expected = hmac_tag(psk, &data);
+            if !ct_eq(&expected, &client_mac) {
+                bail!("Handshake auth failed");
+            }
+            Ok(())
+        }
+        TransportMode::AppTcp => {
+            log_debug("Handshake: waiting for client hello");
+            let head = read_http_head(stream).await?;
+            let head_str = std::str::from_utf8(&head).context("Invalid HTTP handshake header")?;
+            let auth = find_header_value(head_str, "x-myt-auth")
+                .ok_or_else(|| anyhow!("Missing X-Myt-Auth header"))?;
+            let (nonce_hex, mac_hex) = auth
+                .split_once(':')
+                .ok_or_else(|| anyhow!("Invalid X-Myt-Auth format"))?;
+            let nonce_vec = hex::decode(nonce_hex).context("Invalid nonce hex")?;
+            let mac_vec = hex::decode(mac_hex).context("Invalid mac hex")?;
+            if nonce_vec.len() != NONCE_LEN || mac_vec.len() != MAC_LEN {
+                bail!("Invalid X-Myt-Auth lengths");
+            }
+            let mut client_nonce = [0u8; NONCE_LEN];
+            client_nonce.copy_from_slice(&nonce_vec);
+            let mut client_mac = [0u8; MAC_LEN];
+            client_mac.copy_from_slice(&mac_vec);
+
+            let mut data = Vec::with_capacity(6 + NONCE_LEN);
+            data.extend_from_slice(b"client");
+            data.extend_from_slice(&client_nonce);
+            let expected = hmac_tag(psk, &data);
+            if !ct_eq(&expected, &client_mac) {
+                bail!("Handshake auth failed");
+            }
+
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
+                )
+                .await?;
+            log_debug("Handshake: got client hello");
+            Ok(())
+        }
+    }
+}
+
+async fn client_handshake(stream: &mut TcpStream, psk: &[u8; 32], transport: TransportMode) -> Result<()> {
     let mut client_nonce = [0u8; NONCE_LEN];
     rand::rngs::OsRng.fill_bytes(&mut client_nonce);
 
@@ -808,11 +964,29 @@ async fn client_handshake(stream: &mut TcpStream, psk: &[u8; 32]) -> Result<()> 
     data.extend_from_slice(&client_nonce);
     let client_mac = hmac_tag(psk, &data);
 
-    stream.write_all(&[HANDSHAKE_CLIENT_HELLO]).await?;
-    stream.write_all(&client_nonce).await?;
-    stream.write_all(&client_mac).await?;
-    log_debug("Handshake: sent client hello");
-    Ok(())
+    match transport {
+        TransportMode::Raw => {
+            stream.write_all(&[HANDSHAKE_CLIENT_HELLO]).await?;
+            stream.write_all(&client_nonce).await?;
+            stream.write_all(&client_mac).await?;
+            log_debug("Handshake: sent client hello");
+            Ok(())
+        }
+        TransportMode::AppTcp => {
+            let auth = format!("{}:{}", hex::encode(client_nonce), hex::encode(client_mac));
+            let req = format!(
+                "POST /connect HTTP/1.1\r\nHost: update.googleapis.com\r\nUser-Agent: okhttp/4.12.0\r\nContent-Length: 0\r\nConnection: keep-alive\r\nX-Myt-Auth: {auth}\r\n\r\n"
+            );
+            stream.write_all(req.as_bytes()).await?;
+            let head = read_http_head(stream).await?;
+            let head_str = std::str::from_utf8(&head).context("Invalid HTTP handshake response")?;
+            if !head_str.starts_with("HTTP/1.1 200") {
+                bail!("Invalid handshake response");
+            }
+            log_debug("Handshake: sent client hello");
+            Ok(())
+        }
+    }
 }
 
 fn hmac_tag(key: &[u8], data: &[u8]) -> [u8; 32] {
@@ -838,6 +1012,68 @@ fn is_valid_psk(psk_hex: &str) -> bool {
     parse_psk(psk_hex).is_ok()
 }
 
+async fn read_http_head<R>(reader: &mut R) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut head = Vec::with_capacity(512);
+    let mut byte = [0u8; 1];
+    loop {
+        reader.read_exact(&mut byte).await?;
+        head.push(byte[0]);
+        if head.len() > 16 * 1024 {
+            bail!("HTTP header too large");
+        }
+        if head.ends_with(b"\r\n\r\n") {
+            break;
+        }
+    }
+    Ok(head)
+}
+
+async fn read_http_body<R>(reader: &mut R) -> Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let head = read_http_head(reader).await?;
+    let head_str = std::str::from_utf8(&head).context("Invalid HTTP envelope header")?;
+    let len = find_header_value(head_str, "content-length")
+        .ok_or_else(|| anyhow!("Missing Content-Length"))?
+        .parse::<usize>()
+        .context("Invalid Content-Length")?;
+    if len > 32 * 1024 * 1024 {
+        bail!("HTTP body too large");
+    }
+    let mut body = vec![0u8; len];
+    if len > 0 {
+        reader.read_exact(&mut body).await?;
+    }
+    Ok(body)
+}
+
+async fn write_http_envelope(writer: &mut OwnedWriteHalf, path: &str, body: &[u8]) -> Result<()> {
+    let header = format!(
+        "POST {path} HTTP/1.1\r\nHost: update.googleapis.com\r\nUser-Agent: okhttp/4.12.0\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+        body.len()
+    );
+    writer.write_all(header.as_bytes()).await?;
+    if !body.is_empty() {
+        writer.write_all(body).await?;
+    }
+    Ok(())
+}
+
+fn find_header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
+    for line in headers.split("\r\n") {
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case(name) {
+                return Some(v.trim());
+            }
+        }
+    }
+    None
+}
+
 fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -847,6 +1083,17 @@ fn ct_eq(a: &[u8], b: &[u8]) -> bool {
         diff |= a[i] ^ b[i];
     }
     diff == 0
+}
+
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn touch_conn(conn: &ConnState) {
+    conn.last_activity.store(now_secs(), Ordering::Relaxed);
 }
 
 
