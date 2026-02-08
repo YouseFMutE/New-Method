@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    net::IpAddr,
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
@@ -38,6 +39,7 @@ const NONCE_LEN: usize = 24;
 const MAC_LEN: usize = 32;
 const HANDSHAKE_TIMEOUT_SECS: u64 = 8;
 const FRAME_IO_TIMEOUT_SECS: u64 = 12;
+const FRAME_READ_TIMEOUT_SECS: u64 = 45;
 
 #[derive(Debug)]
 struct Frame {
@@ -115,6 +117,8 @@ struct Config {
 struct ServerConfig {
     tunnel_listen: String,
     public_listen: String,
+    #[serde(default)]
+    tunnel_allow_ips: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -210,10 +214,21 @@ fn run_init(config_path: PathBuf) -> Result<()> {
                 .with_prompt("Public listen address")
                 .default("0.0.0.0:1414".into())
                 .interact_text()?;
+            let tunnel_allow_ips_raw: String = Input::new()
+                .with_prompt("Allowed tunnel source IPs (comma-separated, empty=any)")
+                .allow_empty(true)
+                .interact_text()?;
+            let tunnel_allow_ips = tunnel_allow_ips_raw
+                .split(',')
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>();
             (
                 Some(ServerConfig {
                     tunnel_listen,
                     public_listen,
+                    tunnel_allow_ips,
                 }),
                 None,
             )
@@ -308,6 +323,7 @@ async fn run_server(
 ) -> Result<()> {
     let tunnel_listen = server.tunnel_listen.clone();
     let public_listen = server.public_listen.clone();
+    let tunnel_allow_ips = parse_allowed_ips(&server.tunnel_allow_ips)?;
 
     let tunnel_listener = TcpListener::bind(&tunnel_listen)
         .await
@@ -330,13 +346,20 @@ async fn run_server(
                     "Waiting for client tunnel on {}",
                     tunnel_listen
                 ));
-                let (mut tunnel_stream, _) = match tunnel_listener.accept().await {
+                let (mut tunnel_stream, peer_addr) = match tunnel_listener.accept().await {
                     Ok(v) => v,
                     Err(e) => {
                         eprintln!("Tunnel accept failed: {e}");
                         continue;
                     }
                 };
+                if !tunnel_allow_ips.is_empty() && !tunnel_allow_ips.contains(&peer_addr.ip()) {
+                    log_debug(&format!(
+                        "Drop unauthorized tunnel source {}",
+                        peer_addr
+                    ));
+                    continue;
+                }
                 apply_socket_opts(&tunnel_stream);
                 let peer = tunnel_stream
                     .peer_addr()
@@ -517,23 +540,29 @@ async fn run_client_session(
         match TcpStream::connect(&client.server_tunnel).await {
             Ok(mut tunnel_stream) => {
                 apply_socket_opts(&tunnel_stream);
-                delay = reconnect_delay_ms;
-                match tokio::time::timeout(
+                let hs_ok = match tokio::time::timeout(
                     Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
                     client_handshake(&mut tunnel_stream, &psk, transport),
                 )
                 .await
                 {
-                    Ok(Ok(())) => {}
+                    Ok(Ok(())) => true,
                     Ok(Err(e)) => {
                         eprintln!("Handshake failed: {e}");
-                        continue;
+                        false
                     }
                     Err(_) => {
                         eprintln!("Handshake timeout");
-                        continue;
+                        false
                     }
+                };
+                if !hs_ok {
+                    log_info(&format!("Reconnecting in {} ms", delay));
+                    tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+                    delay = std::cmp::min(delay * 2, reconnect_max_delay_ms);
+                    continue;
                 }
+                delay = reconnect_delay_ms;
                 log_info(&format!("Tunnel connected to server (session {})", session_id));
                 let (read_half, write_half) = tunnel_stream.into_split();
                 let (tx, rx) = mpsc::channel::<Frame>(2048);
@@ -588,7 +617,15 @@ async fn tunnel_writer(
     transport: TransportMode,
 ) -> Result<()> {
     while let Some(frame) = rx.recv().await {
-        write_frame(&mut writer, &frame, transport).await?;
+        match tokio::time::timeout(
+            Duration::from_secs(FRAME_IO_TIMEOUT_SECS),
+            write_frame(&mut writer, &frame, transport),
+        )
+        .await
+        {
+            Ok(res) => res?,
+            Err(_) => bail!("Tunnel writer timed out"),
+        }
     }
     Ok(())
 }
@@ -616,7 +653,15 @@ async fn tunnel_reader_server(
     transport: TransportMode,
 ) -> Result<()> {
     loop {
-        let frame = read_frame(&mut reader, transport).await?;
+        let frame = match tokio::time::timeout(
+            Duration::from_secs(FRAME_READ_TIMEOUT_SECS),
+            read_frame(&mut reader, transport),
+        )
+        .await
+        {
+            Ok(res) => res?,
+            Err(_) => bail!("Tunnel reader timed out"),
+        };
         match frame.kind {
             FRAME_DATA => {
                 let conn = { conns.lock().await.get(&frame.id).cloned() };
@@ -685,7 +730,15 @@ async fn tunnel_reader_client(
     transport: TransportMode,
 ) -> Result<()> {
     loop {
-        let frame = read_frame(&mut reader, transport).await?;
+        let frame = match tokio::time::timeout(
+            Duration::from_secs(FRAME_READ_TIMEOUT_SECS),
+            read_frame(&mut reader, transport),
+        )
+        .await
+        {
+            Ok(res) => res?,
+            Err(_) => bail!("Tunnel reader timed out"),
+        };
         match frame.kind {
             FRAME_OPEN => {
                 let id = frame.id;
@@ -1163,6 +1216,17 @@ fn now_secs() -> u64 {
 
 fn touch_conn(conn: &ConnState) {
     conn.last_activity.store(now_secs(), Ordering::Relaxed);
+}
+
+fn parse_allowed_ips(values: &[String]) -> Result<Vec<IpAddr>> {
+    let mut out = Vec::with_capacity(values.len());
+    for raw in values {
+        let ip = raw
+            .parse::<IpAddr>()
+            .with_context(|| format!("Invalid tunnel_allow_ips entry: {raw}"))?;
+        out.push(ip);
+    }
+    Ok(out)
 }
 
 

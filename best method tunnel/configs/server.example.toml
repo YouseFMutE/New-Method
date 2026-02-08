@@ -8,3 +8,4 @@ reconnect_max_delay_ms = 15000
 [server]
 tunnel_listen = "0.0.0.0:9000"
 public_listen = "0.0.0.0:1414"
+tunnel_allow_ips = ["203.0.113.10"]
