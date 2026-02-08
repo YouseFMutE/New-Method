@@ -3,7 +3,7 @@ use std::{
     net::IpAddr,
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
         Arc,
     },
     time::Duration,
@@ -334,7 +334,6 @@ async fn run_server(
 
     let sessions: SessionList = Arc::new(Mutex::new(Vec::new()));
     let session_seq = Arc::new(AtomicU64::new(1));
-    let rr = Arc::new(AtomicUsize::new(0));
 
     // Accept tunnel connection in background.
     {
@@ -446,13 +445,9 @@ async fn run_server(
         log_debug(&format!("Public connection from {}", peer));
 
         let session = {
-            let list = sessions.lock().await;
-            if list.is_empty() {
-                None
-            } else {
-                let idx = rr.fetch_add(1, Ordering::Relaxed) % list.len();
-                Some(list[idx].clone())
-            }
+            let mut list = sessions.lock().await;
+            list.retain(|s| !s.tx.is_closed());
+            list.last().cloned()
         };
         let session = match session {
             Some(s) => s,
