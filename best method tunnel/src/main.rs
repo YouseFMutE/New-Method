@@ -36,6 +36,8 @@ const FRAME_FIN: u8 = 0x05;
 
 const NONCE_LEN: usize = 24;
 const MAC_LEN: usize = 32;
+const HANDSHAKE_TIMEOUT_SECS: u64 = 8;
+const FRAME_IO_TIMEOUT_SECS: u64 = 12;
 
 #[derive(Debug)]
 struct Frame {
@@ -340,9 +342,21 @@ async fn run_server(
                     .peer_addr()
                     .map(|p| p.to_string())
                     .unwrap_or_else(|_| "unknown".into());
-                if let Err(e) = server_handshake(&mut tunnel_stream, &psk, transport).await {
-                    eprintln!("Handshake failed: {e}");
-                    continue;
+                match tokio::time::timeout(
+                    Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+                    server_handshake(&mut tunnel_stream, &psk, transport),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        eprintln!("Handshake failed: {e}");
+                        continue;
+                    }
+                    Err(_) => {
+                        eprintln!("Handshake timeout");
+                        continue;
+                    }
                 }
                 log_info(&format!("Tunnel connected from {}", peer));
 
@@ -504,9 +518,21 @@ async fn run_client_session(
             Ok(mut tunnel_stream) => {
                 apply_socket_opts(&tunnel_stream);
                 delay = reconnect_delay_ms;
-                if let Err(e) = client_handshake(&mut tunnel_stream, &psk, transport).await {
-                    eprintln!("Handshake failed: {e}");
-                    continue;
+                match tokio::time::timeout(
+                    Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+                    client_handshake(&mut tunnel_stream, &psk, transport),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        eprintln!("Handshake failed: {e}");
+                        continue;
+                    }
+                    Err(_) => {
+                        eprintln!("Handshake timeout");
+                        continue;
+                    }
                 }
                 log_info(&format!("Tunnel connected to server (session {})", session_id));
                 let (read_half, write_half) = tunnel_stream.into_split();
@@ -596,18 +622,35 @@ async fn tunnel_reader_server(
                 let conn = { conns.lock().await.get(&frame.id).cloned() };
                 if let Some(conn) = conn {
                     let mut w = conn.writer.lock().await;
-                    if let Err(e) = w.write_all(&frame.data).await {
-                        eprintln!("Write to public failed: {e}");
-                        close_conn(&conns, frame.id).await;
-                        let _ = tx
-                            .send(Frame {
-                                kind: FRAME_CLOSE,
-                                id: frame.id,
-                                data: Vec::new(),
-                            })
-                            .await;
-                    } else {
-                        touch_conn(&conn);
+                    match tokio::time::timeout(
+                        Duration::from_secs(FRAME_IO_TIMEOUT_SECS),
+                        w.write_all(&frame.data),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => touch_conn(&conn),
+                        Ok(Err(e)) => {
+                            eprintln!("Write to public failed: {e}");
+                            close_conn(&conns, frame.id).await;
+                            let _ = tx
+                                .send(Frame {
+                                    kind: FRAME_CLOSE,
+                                    id: frame.id,
+                                    data: Vec::new(),
+                                })
+                                .await;
+                        }
+                        Err(_) => {
+                            eprintln!("Write to public timed out");
+                            close_conn(&conns, frame.id).await;
+                            let _ = tx
+                                .send(Frame {
+                                    kind: FRAME_CLOSE,
+                                    id: frame.id,
+                                    data: Vec::new(),
+                                })
+                                .await;
+                        }
                     }
                 }
             }
@@ -680,18 +723,35 @@ async fn tunnel_reader_client(
                 let conn = { conns.lock().await.get(&frame.id).cloned() };
                 if let Some(conn) = conn {
                     let mut w = conn.writer.lock().await;
-                    if let Err(e) = w.write_all(&frame.data).await {
-                        eprintln!("Write to target failed: {e}");
-                        close_conn(&conns, frame.id).await;
-                        let _ = tx
-                            .send(Frame {
-                                kind: FRAME_CLOSE,
-                                id: frame.id,
-                                data: Vec::new(),
-                            })
-                            .await;
-                    } else {
-                        touch_conn(&conn);
+                    match tokio::time::timeout(
+                        Duration::from_secs(FRAME_IO_TIMEOUT_SECS),
+                        w.write_all(&frame.data),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => touch_conn(&conn),
+                        Ok(Err(e)) => {
+                            eprintln!("Write to target failed: {e}");
+                            close_conn(&conns, frame.id).await;
+                            let _ = tx
+                                .send(Frame {
+                                    kind: FRAME_CLOSE,
+                                    id: frame.id,
+                                    data: Vec::new(),
+                                })
+                                .await;
+                        }
+                        Err(_) => {
+                            eprintln!("Write to target timed out");
+                            close_conn(&conns, frame.id).await;
+                            let _ = tx
+                                .send(Frame {
+                                    kind: FRAME_CLOSE,
+                                    id: frame.id,
+                                    data: Vec::new(),
+                                })
+                                .await;
+                        }
                     }
                 } else {
                     eprintln!("DATA for unknown id={}", frame.id);
@@ -754,15 +814,24 @@ async fn pump_socket_to_tunnel(
                     log_debug(&format!("TX DATA id={} bytes={}", id, n));
                     first = false;
                 }
-                if tx
-                    .send(Frame {
+                let send_res = tokio::time::timeout(
+                    Duration::from_secs(FRAME_IO_TIMEOUT_SECS),
+                    tx.send(Frame {
                         kind: FRAME_DATA,
                         id,
                         data: buf[..n].to_vec(),
-                    })
-                    .await
-                    .is_err()
-                {
+                    }),
+                )
+                .await;
+                let send_failed = match send_res {
+                    Ok(Ok(())) => false,
+                    Ok(Err(_)) => true,
+                    Err(_) => {
+                        eprintln!("Send frame timed out id={}", id);
+                        true
+                    }
+                };
+                if send_failed {
                     let _ = tx
                         .send(Frame {
                             kind: FRAME_CLOSE,
