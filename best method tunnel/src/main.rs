@@ -150,7 +150,7 @@ fn run_init(config_path: PathBuf) -> Result<()> {
     let role = if role == 0 { Role::Server } else { Role::Client };
     let transport = Select::new()
         .with_prompt("Transport mode")
-        .items(&["app_tcp (HTTP-like framing)", "raw (legacy binary)"])
+        .items(&["app_tcp (HTTP CONNECT camouflage)", "raw (legacy binary)"])
         .default(0)
         .interact()?;
     let transport = if transport == 0 {
@@ -938,58 +938,13 @@ async fn reap_half_closed(conns: ConnMap) {
 
 async fn write_frame(writer: &mut OwnedWriteHalf, frame: &Frame, transport: TransportMode) -> Result<()> {
     match transport {
-        TransportMode::Raw => {
-            writer.write_all(&[frame.kind]).await?;
-            writer.write_all(&frame.id.to_be_bytes()).await?;
-            let len = frame.data.len() as u32;
-            writer.write_all(&len.to_be_bytes()).await?;
-            if len > 0 {
-                writer.write_all(&frame.data).await?;
-            }
-            Ok(())
-        }
-        TransportMode::AppTcp => {
-            let mut payload = Vec::with_capacity(9 + frame.data.len());
-            payload.push(frame.kind);
-            payload.extend_from_slice(&frame.id.to_be_bytes());
-            payload.extend_from_slice(&(frame.data.len() as u32).to_be_bytes());
-            payload.extend_from_slice(&frame.data);
-            write_http_envelope(writer, "/sync", &payload).await
-        }
+        TransportMode::Raw | TransportMode::AppTcp => write_raw_frame(writer, frame).await,
     }
 }
 
 async fn read_frame(reader: &mut OwnedReadHalf, transport: TransportMode) -> Result<Frame> {
     match transport {
-        TransportMode::Raw => {
-            let mut header = [0u8; 9];
-            reader.read_exact(&mut header).await?;
-            let kind = header[0];
-            let id = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
-            let len = u32::from_be_bytes([header[5], header[6], header[7], header[8]]) as usize;
-            let mut data = vec![0u8; len];
-            if len > 0 {
-                reader.read_exact(&mut data).await?;
-            }
-            Ok(Frame { kind, id, data })
-        }
-        TransportMode::AppTcp => {
-            let payload = read_http_body(reader).await?;
-            if payload.len() < 9 {
-                bail!("Invalid app_tcp frame payload");
-            }
-            let kind = payload[0];
-            let id = u32::from_be_bytes([payload[1], payload[2], payload[3], payload[4]]);
-            let len = u32::from_be_bytes([payload[5], payload[6], payload[7], payload[8]]) as usize;
-            if payload.len() != len + 9 {
-                bail!("Invalid app_tcp frame length");
-            }
-            Ok(Frame {
-                kind,
-                id,
-                data: payload[9..].to_vec(),
-            })
-        }
+        TransportMode::Raw | TransportMode::AppTcp => read_raw_frame(reader).await,
     }
 }
 
@@ -1021,6 +976,9 @@ async fn server_handshake(stream: &mut TcpStream, psk: &[u8; 32], transport: Tra
             log_debug("Handshake: waiting for client hello");
             let head = read_http_head(stream).await?;
             let head_str = std::str::from_utf8(&head).context("Invalid HTTP handshake header")?;
+            if !head_str.starts_with("CONNECT ") {
+                bail!("Invalid app_tcp handshake method");
+            }
             let auth = find_header_value(head_str, "x-myt-auth")
                 .ok_or_else(|| anyhow!("Missing X-Myt-Auth header"))?;
             let (nonce_hex, mac_hex) = auth
@@ -1046,7 +1004,7 @@ async fn server_handshake(stream: &mut TcpStream, psk: &[u8; 32], transport: Tra
 
             stream
                 .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
+                    b"HTTP/1.1 200 Connection Established\r\nProxy-Agent: nginx\r\n\r\n",
                 )
                 .await?;
             log_debug("Handshake: got client hello");
@@ -1075,7 +1033,7 @@ async fn client_handshake(stream: &mut TcpStream, psk: &[u8; 32], transport: Tra
         TransportMode::AppTcp => {
             let auth = format!("{}:{}", hex::encode(client_nonce), hex::encode(client_mac));
             let req = format!(
-                "POST /connect HTTP/1.1\r\nHost: update.googleapis.com\r\nUser-Agent: okhttp/4.12.0\r\nContent-Length: 0\r\nConnection: keep-alive\r\nX-Myt-Auth: {auth}\r\n\r\n"
+                "CONNECT update.googleapis.com:443 HTTP/1.1\r\nHost: update.googleapis.com:443\r\nUser-Agent: okhttp/4.12.0\r\nProxy-Connection: keep-alive\r\nX-Myt-Auth: {auth}\r\n\r\n"
             );
             stream.write_all(req.as_bytes()).await?;
             let head = read_http_head(stream).await?;
@@ -1131,36 +1089,28 @@ where
     Ok(head)
 }
 
-async fn read_http_body<R>(reader: &mut R) -> Result<Vec<u8>>
-where
-    R: AsyncRead + Unpin,
-{
-    let head = read_http_head(reader).await?;
-    let head_str = std::str::from_utf8(&head).context("Invalid HTTP envelope header")?;
-    let len = find_header_value(head_str, "content-length")
-        .ok_or_else(|| anyhow!("Missing Content-Length"))?
-        .parse::<usize>()
-        .context("Invalid Content-Length")?;
-    if len > 32 * 1024 * 1024 {
-        bail!("HTTP body too large");
-    }
-    let mut body = vec![0u8; len];
+async fn write_raw_frame(writer: &mut OwnedWriteHalf, frame: &Frame) -> Result<()> {
+    writer.write_all(&[frame.kind]).await?;
+    writer.write_all(&frame.id.to_be_bytes()).await?;
+    let len = frame.data.len() as u32;
+    writer.write_all(&len.to_be_bytes()).await?;
     if len > 0 {
-        reader.read_exact(&mut body).await?;
-    }
-    Ok(body)
-}
-
-async fn write_http_envelope(writer: &mut OwnedWriteHalf, path: &str, body: &[u8]) -> Result<()> {
-    let header = format!(
-        "POST {path} HTTP/1.1\r\nHost: update.googleapis.com\r\nUser-Agent: okhttp/4.12.0\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
-        body.len()
-    );
-    writer.write_all(header.as_bytes()).await?;
-    if !body.is_empty() {
-        writer.write_all(body).await?;
+        writer.write_all(&frame.data).await?;
     }
     Ok(())
+}
+
+async fn read_raw_frame(reader: &mut OwnedReadHalf) -> Result<Frame> {
+    let mut header = [0u8; 9];
+    reader.read_exact(&mut header).await?;
+    let kind = header[0];
+    let id = u32::from_be_bytes([header[1], header[2], header[3], header[4]]);
+    let len = u32::from_be_bytes([header[5], header[6], header[7], header[8]]) as usize;
+    let mut data = vec![0u8; len];
+    if len > 0 {
+        reader.read_exact(&mut data).await?;
+    }
+    Ok(Frame { kind, id, data })
 }
 
 fn find_header_value<'a>(headers: &'a str, name: &str) -> Option<&'a str> {
