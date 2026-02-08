@@ -338,12 +338,10 @@ async fn run_server(
     {
         let sessions = Arc::clone(&sessions);
         let session_seq = Arc::clone(&session_seq);
+        let tunnel_allow_ips = Arc::new(tunnel_allow_ips);
         tokio::spawn(async move {
             loop {
-                log_info(&format!(
-                    "Waiting for client tunnel on {}",
-                    tunnel_listen
-                ));
+                log_info(&format!("Waiting for client tunnel on {}", tunnel_listen));
                 let (mut tunnel_stream, peer_addr) = match tunnel_listener.accept().await {
                     Ok(v) => v,
                     Err(e) => {
@@ -352,83 +350,22 @@ async fn run_server(
                     }
                 };
                 if !tunnel_allow_ips.is_empty() && !tunnel_allow_ips.contains(&peer_addr.ip()) {
-                    log_debug(&format!(
-                        "Drop unauthorized tunnel source {}",
-                        peer_addr
-                    ));
+                    log_debug(&format!("Drop unauthorized tunnel source {}", peer_addr));
                     continue;
                 }
                 apply_socket_opts(&tunnel_stream);
-                let peer = tunnel_stream
-                    .peer_addr()
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|_| "unknown".into());
-                match tokio::time::timeout(
-                    Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
-                    server_handshake(&mut tunnel_stream, &psk, transport),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        eprintln!("Handshake failed: {e}");
-                        continue;
-                    }
-                    Err(_) => {
-                        eprintln!("Handshake timeout");
-                        continue;
-                    }
-                }
-                log_info(&format!("Tunnel connected from {}", peer));
-
-                let (read_half, write_half) = tunnel_stream.into_split();
-                let (tx, rx) = mpsc::channel::<Frame>(2048);
-                let session = Arc::new(TunnelSession {
-                    id: session_seq.fetch_add(1, Ordering::Relaxed),
-                    tx: tx.clone(),
-                    conns: Arc::new(Mutex::new(HashMap::new())),
-                    next_id: AtomicU32::new(1),
+                let sessions = Arc::clone(&sessions);
+                let session_seq = Arc::clone(&session_seq);
+                tokio::spawn(async move {
+                    handle_server_tunnel_conn(
+                        tunnel_stream,
+                        psk,
+                        transport,
+                        sessions,
+                        session_seq,
+                    )
+                    .await;
                 });
-                sessions.lock().await.push(Arc::clone(&session));
-
-                let mut writer_task = tokio::spawn(tunnel_writer(write_half, rx, transport));
-                let mut reader_task = tokio::spawn(tunnel_reader_server(
-                    read_half,
-                    Arc::clone(&session.conns),
-                    tx,
-                    transport,
-                ));
-                let keepalive_task = tokio::spawn(keepalive_loop(session.tx.clone()));
-                let reaper_task = tokio::spawn(reap_half_closed(Arc::clone(&session.conns)));
-
-                tokio::select! {
-                    res = &mut reader_task => {
-                        match res {
-                            Ok(Ok(())) => log_debug("Tunnel reader finished"),
-                            Ok(Err(e)) => eprintln!("Tunnel reader error: {e}"),
-                            Err(e) => eprintln!("Tunnel reader join error: {e}"),
-                        }
-                    }
-                    res = &mut writer_task => {
-                        match res {
-                            Ok(Ok(())) => log_debug("Tunnel writer finished"),
-                            Ok(Err(e)) => eprintln!("Tunnel writer error: {e}"),
-                            Err(e) => eprintln!("Tunnel writer join error: {e}"),
-                        }
-                    }
-                }
-
-                keepalive_task.abort();
-                reaper_task.abort();
-                reader_task.abort();
-                writer_task.abort();
-
-                {
-                    let mut list = sessions.lock().await;
-                    list.retain(|s| s.id != session.id);
-                }
-                close_all_conns(&session.conns).await;
-                log_info("Tunnel disconnected");
             }
         });
     }
@@ -489,6 +426,86 @@ async fn run_server(
             log_debug(&format!("FIN id={} from {}", id, peer));
         });
     }
+}
+
+async fn handle_server_tunnel_conn(
+    mut tunnel_stream: TcpStream,
+    psk: [u8; 32],
+    transport: TransportMode,
+    sessions: SessionList,
+    session_seq: Arc<AtomicU64>,
+) {
+    let peer = tunnel_stream
+        .peer_addr()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|_| "unknown".into());
+
+    match tokio::time::timeout(
+        Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
+        server_handshake(&mut tunnel_stream, &psk, transport),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            eprintln!("Handshake failed: {e}");
+            return;
+        }
+        Err(_) => {
+            eprintln!("Handshake timeout");
+            return;
+        }
+    }
+    log_info(&format!("Tunnel connected from {}", peer));
+
+    let (read_half, write_half) = tunnel_stream.into_split();
+    let (tx, rx) = mpsc::channel::<Frame>(2048);
+    let session = Arc::new(TunnelSession {
+        id: session_seq.fetch_add(1, Ordering::Relaxed),
+        tx: tx.clone(),
+        conns: Arc::new(Mutex::new(HashMap::new())),
+        next_id: AtomicU32::new(1),
+    });
+    sessions.lock().await.push(Arc::clone(&session));
+
+    let mut writer_task = tokio::spawn(tunnel_writer(write_half, rx, transport));
+    let mut reader_task = tokio::spawn(tunnel_reader_server(
+        read_half,
+        Arc::clone(&session.conns),
+        tx,
+        transport,
+    ));
+    let keepalive_task = tokio::spawn(keepalive_loop(session.tx.clone()));
+    let reaper_task = tokio::spawn(reap_half_closed(Arc::clone(&session.conns)));
+
+    tokio::select! {
+        res = &mut reader_task => {
+            match res {
+                Ok(Ok(())) => log_debug("Tunnel reader finished"),
+                Ok(Err(e)) => eprintln!("Tunnel reader error: {e}"),
+                Err(e) => eprintln!("Tunnel reader join error: {e}"),
+            }
+        }
+        res = &mut writer_task => {
+            match res {
+                Ok(Ok(())) => log_debug("Tunnel writer finished"),
+                Ok(Err(e)) => eprintln!("Tunnel writer error: {e}"),
+                Err(e) => eprintln!("Tunnel writer join error: {e}"),
+            }
+        }
+    }
+
+    keepalive_task.abort();
+    reaper_task.abort();
+    reader_task.abort();
+    writer_task.abort();
+
+    {
+        let mut list = sessions.lock().await;
+        list.retain(|s| s.id != session.id);
+    }
+    close_all_conns(&session.conns).await;
+    log_info("Tunnel disconnected");
 }
 
 async fn run_client(
