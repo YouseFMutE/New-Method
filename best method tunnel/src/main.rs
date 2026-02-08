@@ -39,7 +39,6 @@ const NONCE_LEN: usize = 24;
 const MAC_LEN: usize = 32;
 const HANDSHAKE_TIMEOUT_SECS: u64 = 8;
 const FRAME_IO_TIMEOUT_SECS: u64 = 12;
-const FRAME_READ_TIMEOUT_SECS: u64 = 45;
 
 #[derive(Debug)]
 struct Frame {
@@ -648,15 +647,7 @@ async fn tunnel_reader_server(
     transport: TransportMode,
 ) -> Result<()> {
     loop {
-        let frame = match tokio::time::timeout(
-            Duration::from_secs(FRAME_READ_TIMEOUT_SECS),
-            read_frame(&mut reader, transport),
-        )
-        .await
-        {
-            Ok(res) => res?,
-            Err(_) => bail!("Tunnel reader timed out"),
-        };
+        let frame = read_frame(&mut reader, transport).await?;
         match frame.kind {
             FRAME_DATA => {
                 let conn = { conns.lock().await.get(&frame.id).cloned() };
@@ -725,15 +716,7 @@ async fn tunnel_reader_client(
     transport: TransportMode,
 ) -> Result<()> {
     loop {
-        let frame = match tokio::time::timeout(
-            Duration::from_secs(FRAME_READ_TIMEOUT_SECS),
-            read_frame(&mut reader, transport),
-        )
-        .await
-        {
-            Ok(res) => res?,
-            Err(_) => bail!("Tunnel reader timed out"),
-        };
+        let frame = read_frame(&mut reader, transport).await?;
         match frame.kind {
             FRAME_OPEN => {
                 let id = frame.id;
